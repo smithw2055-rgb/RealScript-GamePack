@@ -932,6 +932,7 @@ runtime::ParallelJobResult ScriptRuntime::dispatchEcsParallel(
         return result;
     }
     runtime::ScopedValuePoolDomain domainScope(heap_->valuePoolDomain().get());
+    syncParallelBatchFactory();
     if (!parallelScheduler_ ||
         (options.workerCount != 0 && parallelSchedulerWorkers_ != options.workerCount)) {
         parallelScheduler_ = std::make_shared<runtime::ParallelJobScheduler>(options.workerCount);

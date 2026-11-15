@@ -389,6 +389,8 @@ public:
     }
     void setJitBackend(std::shared_ptr<jit::Module> jitModule);
     void clearNativeBackend() noexcept;
+    [[nodiscard]] std::size_t parallelBatchExecutionCount() const noexcept;
+    void resetParallelBatchExecutionCount() noexcept;
 
     void setDebugger(std::shared_ptr<debug::RuntimeDebugHook> debugger) noexcept;
     [[nodiscard]] std::shared_ptr<debug::RuntimeDebugHook> debugger() const noexcept {
@@ -676,6 +678,8 @@ private:
         const std::shared_ptr<const runtime::ProgramImage>&)> remoteDebuggerRebind_;
     mutable std::shared_ptr<runtime::ParallelJobScheduler> parallelScheduler_;
     mutable std::size_t parallelSchedulerWorkers_ = 0;
+
+    void syncParallelBatchFactory() const;
 
 #if defined(_MSC_VER)
 #pragma warning(push)

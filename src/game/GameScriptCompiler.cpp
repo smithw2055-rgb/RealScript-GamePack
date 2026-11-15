@@ -18,31 +18,6 @@ optimization::Level toOptimizationLevel(GameOptimizationLevel level) noexcept {
     return optimization::Level::None;
 }
 
-bool containsToken(std::string_view text, std::string_view needle) noexcept {
-    return !needle.empty() && text.find(needle) != std::string_view::npos;
-}
-
-bool hasMacroAttributeUsage(
-    const std::vector<compiler::SourceFile>& sources,
-    const std::vector<std::shared_ptr<const compiler::ICompilerMacroPlugin>>& plugins) {
-    if (plugins.empty()) return false;
-    std::vector<std::string> macroNames;
-    for (const auto& plugin : plugins) {
-        if (!plugin) continue;
-        const auto names = plugin->macroNames();
-        macroNames.insert(macroNames.end(), names.begin(), names.end());
-    }
-    if (macroNames.empty()) return true;
-    for (const auto& src : sources) {
-        for (const auto& macro : macroNames) {
-            if (containsToken(src.content, "[" + macro)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 std::uint64_t computeMacroFingerprint(
     const std::vector<std::shared_ptr<const compiler::ICompilerMacroPlugin>>& plugins) noexcept {
     std::uint64_t hash = 1469598103934665603ULL;
@@ -102,13 +77,7 @@ void stripHostNativeStubs(
     }
 }
 
-void populateLanguageMetadata(
-    const compiler::BuildResult& build,
-    GameLanguageMetadata& out) {
-    out.genericInstantiations.insert(
-        out.genericInstantiations.end(),
-        build.nativeGenericInstantiations.begin(),
-        build.nativeGenericInstantiations.end());
+void finalizeLanguageMetadata(GameLanguageMetadata& out) {
     std::sort(
         out.genericInstantiations.begin(),
         out.genericInstantiations.end(),
@@ -131,10 +100,6 @@ void populateLanguageMetadata(
                     left.arguments == right.arguments;
             }),
         out.genericInstantiations.end());
-    out.attributes.insert(
-        out.attributes.end(),
-        build.nativeAttributes.begin(),
-        build.nativeAttributes.end());
     std::stable_sort(
         out.attributes.begin(),
         out.attributes.end(),
@@ -150,10 +115,6 @@ void populateLanguageMetadata(
             }
             return left.offset < right.offset;
         });
-    out.sequences.insert(
-        out.sequences.end(),
-        build.nativeSequences.begin(),
-        build.nativeSequences.end());
     std::stable_sort(
         out.sequences.begin(),
         out.sequences.end(),
@@ -163,16 +124,58 @@ void populateLanguageMetadata(
             }
             return left.name < right.name;
         });
-    out.interfaces.insert(
-        out.interfaces.end(),
-        build.nativeInterfaces.begin(),
-        build.nativeInterfaces.end());
     std::stable_sort(
         out.interfaces.begin(),
         out.interfaces.end(),
         [](const auto& left, const auto& right) {
             return left.typeName < right.typeName;
         });
+}
+
+void populateLanguageMetadata(
+    const compiler::BuildResult& build,
+    GameLanguageMetadata& out) {
+    out.genericInstantiations.insert(
+        out.genericInstantiations.end(),
+        build.nativeGenericInstantiations.begin(),
+        build.nativeGenericInstantiations.end());
+    out.attributes.insert(
+        out.attributes.end(),
+        build.nativeAttributes.begin(),
+        build.nativeAttributes.end());
+    out.sequences.insert(
+        out.sequences.end(),
+        build.nativeSequences.begin(),
+        build.nativeSequences.end());
+    out.interfaces.insert(
+        out.interfaces.end(),
+        build.nativeInterfaces.begin(),
+        build.nativeInterfaces.end());
+    finalizeLanguageMetadata(out);
+}
+
+void populateLanguageMetadataFromModules(
+    const std::vector<bytecode::Module>& modules,
+    GameLanguageMetadata& out) {
+    for (const auto& mod : modules) {
+        out.genericInstantiations.insert(
+            out.genericInstantiations.end(),
+            mod.languageMetadata.genericInstantiations.begin(),
+            mod.languageMetadata.genericInstantiations.end());
+        out.attributes.insert(
+            out.attributes.end(),
+            mod.languageMetadata.attributes.begin(),
+            mod.languageMetadata.attributes.end());
+        out.sequences.insert(
+            out.sequences.end(),
+            mod.languageMetadata.sequences.begin(),
+            mod.languageMetadata.sequences.end());
+        out.interfaces.insert(
+            out.interfaces.end(),
+            mod.languageMetadata.interfaces.begin(),
+            mod.languageMetadata.interfaces.end());
+    }
+    finalizeLanguageMetadata(out);
 }
 
 } // namespace
@@ -270,10 +273,8 @@ GameCompileResult GameScriptCompiler::compile(
     std::vector<compiler::SourceFile> allSources = api_.generatedSources();
     allSources.insert(allSources.end(), sources.begin(), sources.end());
 
-    const bool macrosTriggered =
-        !options.extraMacroPlugins.empty() || hasMacroAttributeUsage(sources, macroPlugins);
     const bool useCachePath =
-        options.preferBuildCache && activeCache != nullptr && !macrosTriggered;
+        options.preferBuildCache && activeCache != nullptr;
 
     std::vector<bytecode::Module> modules;
     if (useCachePath) {
@@ -283,6 +284,7 @@ GameCompileResult GameScriptCompiler::compile(
             : activeCache->cacheDirectory();
         cacheOpts.optimizationOptions.level = toOptimizationLevel(options.optimizationLevel);
         cacheOpts.flags = options.buildCacheFlags;
+        cacheOpts.macroPlugins = macroPlugins;
         auto cached = activeCache->build(allSources, cacheOpts);
         result.buildCacheStatistics = cached.statistics;
         result.optimizationStatistics = cached.optimizationStatistics;
@@ -290,6 +292,7 @@ GameCompileResult GameScriptCompiler::compile(
         result.usedBuildCache = true;
         if (result.diagnostics.hasErrors()) return result;
 
+        populateLanguageMetadataFromModules(cached.bytecodeModules, result.languageMetadata);
         modules = std::move(cached.bytecodeModules);
         stripHostNativeStubs(modules, api_);
     } else {
@@ -398,6 +401,7 @@ void ScriptRuntime::setJitBackend(std::shared_ptr<jit::Module> jitModule) {
     nativeProgram_->setHeap(heap_);
     nativeProgram_->setAsyncRuntime(asyncRuntime_);
     backend_ = ScriptExecutionBackend::Jit;
+    syncParallelBatchFactory();
 }
 
 bool ScriptRuntime::startRemoteDebugger(

@@ -1316,9 +1316,369 @@ public class GroupedActor {
     std::cout << "[PASS] Closeout regression suite (eff_1 sequence hot-reload, eff_3 prefab text, perf_4, Physics3D, ECS cmd buffer & Inspector grouping)\n";
 }
 
+class CustomTagMacroPlugin final : public compiler::ICompilerMacroPlugin {
+public:
+    explicit CustomTagMacroPlugin(std::uint64_t fp, int tagValue)
+        : fingerprint_(fp), tagValue_(tagValue) {}
+
+    std::string name() const override { return "CustomTagMacroPlugin"; }
+    std::vector<std::string> macroNames() const override { return {"CustomTag"}; }
+    std::uint64_t fingerprint() const override { return fingerprint_; }
+
+    void expand(
+        const compiler::MacroExpansionContext& context,
+        std::vector<compiler::SourceFile>& outGeneratedSources,
+        diagnostics::DiagnosticBag&) const override {
+        for (const auto& unit : context.parsedUnits) {
+            if (!unit.sourceText) continue;
+            if (unit.sourceText->content().find("[CustomTag]") == std::string::npos) continue;
+            outGeneratedSources.push_back({
+                unit.sourcePath + ".custom_tag.g.rscript",
+                "module " + unit.moduleName + ";\n"
+                "public partial class MacroCachedEntity {\n"
+                "    public static int GetCustomTagValue() { return " + std::to_string(tagValue_) + "; }\n"
+                "}\n",
+            });
+        }
+    }
+
+private:
+    std::uint64_t fingerprint_;
+    int tagValue_;
+};
+
+void testMacroBuildCacheAndMetadataParity() {
+    namespace fs = std::filesystem;
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path cacheDir =
+        fs::temp_directory_path() / ("rs_gp_aud01_audited_" + std::to_string(nonce));
+    fs::create_directories(cacheDir);
+
+    const std::string src = R"(module Game.Aud01Aud02;
+import RealScript.Game;
+
+public class CustomTagAttribute {
+    public CustomTagAttribute() {}
+}
+
+public interface IAudRunner {
+    int Step(int x);
+}
+
+public class PairBox<T> {
+    public T value;
+    public PairBox(T v) { this.value = v; }
+}
+
+[CustomTag]
+public partial class MacroCachedEntity : IAudRunner {
+    [Export]
+    public int hp = 100;
+
+    public int pingCount = 0;
+
+    [Signal]
+    public partial void HealthChanged(int hp);
+
+    [RelayCommand]
+    public void Ping() {
+        this.pingCount = this.pingCount + 1;
+    }
+
+    public int Step(int x) {
+        PairBox<int> box = new PairBox<int>(x);
+        return box.value + 5;
+    }
+
+    public sequence WorkFlow(long target) {
+        this.pingCount = (int)target;
+        yield wait_ticks(1);
+    }
+}
+)";
+
+    game::GameApi api;
+    auto gameplayHost = std::make_shared<game::GameplayHost>(60);
+    RS_CHECK(game::installGameplayBindings(api, gameplayHost));
+    game::GameCompileOptions baselineOpts;
+    baselineOpts.optimizationLevel = game::GameOptimizationLevel::O2;
+    baselineOpts.enableStandardReactiveMacros = true;
+    baselineOpts.preferBuildCache = false;
+    baselineOpts.extraMacroPlugins = {std::make_shared<CustomTagMacroPlugin>(1001ULL, 42)};
+
+    game::GameScriptCompiler refCompiler(api);
+    const auto refCompile = refCompiler.compile({{"MacroEntity.rscript", src}}, baselineOpts);
+    if (!refCompile.succeeded()) {
+        for (const auto& d : refCompile.diagnostics.items()) {
+            std::cerr << "[diag] " << d.code << ": " << d.message << "\n";
+        }
+    }
+    RS_CHECK(refCompile.succeeded());
+    RS_CHECK(!refCompile.usedBuildCache);
+    RS_CHECK(!refCompile.languageMetadata.attributes.empty());
+    RS_CHECK(!refCompile.languageMetadata.interfaces.empty());
+    RS_CHECK(!refCompile.languageMetadata.genericInstantiations.empty());
+    RS_CHECK(!refCompile.languageMetadata.sequences.empty());
+
+    game::GameCompileOptions cacheOpts = baselineOpts;
+    cacheOpts.preferBuildCache = true;
+    cacheOpts.buildCacheDirectory = cacheDir;
+
+    // 1. Cold build populates disk cache even when standard + extra macro plugins are active.
+    game::GameScriptCompiler coldCompiler(api);
+    const auto coldCompile = coldCompiler.compile({{"MacroEntity.rscript", src}}, cacheOpts);
+    if (!coldCompile.succeeded()) {
+        for (const auto& d : coldCompile.diagnostics.items()) {
+            std::cerr << "[cold diag] " << d.code << ": " << d.message << "\n";
+        }
+    }
+    RS_CHECK(coldCompile.succeeded());
+    RS_CHECK(coldCompile.usedBuildCache);
+    RS_CHECK(coldCompile.languageMetadata.attributes.size() == refCompile.languageMetadata.attributes.size());
+    RS_CHECK(coldCompile.languageMetadata.interfaces.size() == refCompile.languageMetadata.interfaces.size());
+    RS_CHECK(coldCompile.languageMetadata.genericInstantiations.size() ==
+             refCompile.languageMetadata.genericInstantiations.size());
+    RS_CHECK(coldCompile.languageMetadata.sequences.size() == refCompile.languageMetadata.sequences.size());
+
+    // 2. Warm compile on a separate GameScriptCompiler hits disk cache AND populates languageMetadata + macros.
+    game::GameScriptCompiler warmCompiler(api);
+    const auto warmCompile = warmCompiler.compile({{"MacroEntity.rscript", src}}, cacheOpts);
+    RS_CHECK(warmCompile.succeeded());
+    RS_CHECK(warmCompile.usedBuildCache);
+    RS_CHECK(warmCompile.buildCacheStatistics.cacheHits >= 1u);
+    RS_CHECK(warmCompile.buildCacheStatistics.cacheMisses == 0u);
+    RS_CHECK(warmCompile.languageMetadata.attributes.size() == refCompile.languageMetadata.attributes.size());
+    RS_CHECK(warmCompile.languageMetadata.interfaces.size() == refCompile.languageMetadata.interfaces.size());
+    RS_CHECK(warmCompile.languageMetadata.genericInstantiations.size() ==
+             refCompile.languageMetadata.genericInstantiations.size());
+    RS_CHECK(warmCompile.languageMetadata.sequences.size() == refCompile.languageMetadata.sequences.size());
+    RS_CHECK(warmCompile.program.languageMetadata().attributes.size() ==
+             refCompile.languageMetadata.attributes.size());
+    RS_CHECK(warmCompile.program.languageMetadata().interfaces.size() ==
+             refCompile.languageMetadata.interfaces.size());
+    RS_CHECK(warmCompile.program.languageMetadata().genericInstantiations.size() ==
+             refCompile.languageMetadata.genericInstantiations.size());
+    RS_CHECK(warmCompile.program.languageMetadata().sequences.size() ==
+             refCompile.languageMetadata.sequences.size());
+
+    {
+        auto rt = game::ScriptRuntime::createIsolated(warmCompile.program);
+        const auto cls = rt.findType("Game.Aud01Aud02::MacroCachedEntity");
+        RS_CHECK(cls.has_value());
+        const auto getTag = rt.findMethod(*cls, "GetCustomTagValue", 0);
+        RS_CHECK(getTag.has_value());
+        const auto tagRes = rt.invokeStatic(*getTag, {});
+        RS_CHECK(tagRes.succeeded && std::get<std::int64_t>(tagRes.value) == 42);
+
+        runtime::RuntimeError createErr;
+        auto obj = rt.createObject(*cls, {}, createErr);
+        RS_CHECK(obj.has_value());
+        const auto stepFn = rt.findMethod(*cls, "Step", 1);
+        RS_CHECK(stepFn.has_value());
+        const auto stepRes = rt.invoke(*obj, *stepFn, {runtime::Value{std::int64_t{10}}});
+        RS_CHECK(stepRes.succeeded && std::get<std::int64_t>(stepRes.value) == 15);
+    }
+
+    // 3. Updating macro plugin fingerprint invalidates the cache cleanly and regenerates macro output.
+    game::GameCompileOptions updatedOpts = cacheOpts;
+    updatedOpts.extraMacroPlugins = {std::make_shared<CustomTagMacroPlugin>(2002ULL, 99)};
+    game::GameScriptCompiler updatedCompiler(api);
+    const auto updatedCompile = updatedCompiler.compile({{"MacroEntity.rscript", src}}, updatedOpts);
+    RS_CHECK(updatedCompile.succeeded());
+    RS_CHECK(updatedCompile.usedBuildCache);
+    RS_CHECK(updatedCompile.buildCacheStatistics.cacheMisses >= 1u);
+    {
+        auto rt = game::ScriptRuntime::createIsolated(updatedCompile.program);
+        const auto cls = rt.findType("Game.Aud01Aud02::MacroCachedEntity");
+        RS_CHECK(cls.has_value());
+        const auto getTag = rt.findMethod(*cls, "GetCustomTagValue", 0);
+        RS_CHECK(getTag.has_value());
+        const auto tagRes = rt.invokeStatic(*getTag, {});
+        RS_CHECK(tagRes.succeeded && std::get<std::int64_t>(tagRes.value) == 99);
+    }
+
+    std::error_code ec;
+    fs::remove_all(cacheDir, ec);
+    std::cout << "[PASS] AUD-01/AUD-02 macro build cache parity, metadata preservation, and fingerprint invalidation\n";
+}
+
+bool gamePackAotStepBodiesImpl(
+    aot::ExecutionContext& /*context*/,
+    const runtime::Value* arguments,
+    std::size_t argumentCount,
+    runtime::Value& result) {
+    (void)arguments;
+    (void)argumentCount;
+    result = runtime::Value{std::monostate{}};
+    return true;
+}
+
+bool gamePackAotStepBodiesBatch(
+    aot::ExecutionContext& /*context*/,
+    runtime::ParallelNativeBatchContext& batch) {
+    if (!batch.userArguments || batch.userArguments->size() != 1u || !batch.mutableHeap) {
+        return false;
+    }
+    const auto* arrRef = std::get_if<runtime::ObjectRef>(&(*batch.userArguments)[0]);
+    if (!arrRef) {
+        return false;
+    }
+    runtime::PackedArrayFastView view{};
+    if (!batch.mutableHeap->tryBindPackedArrayFastView(*arrRef, view)) {
+        return false;
+    }
+    if (view.encoding == runtime::PackedElemEncoding::Int32) {
+        auto* data = static_cast<std::int32_t*>(view.rawData);
+        for (std::size_t off = 0; off < batch.count; ++off) {
+            const std::size_t idx = batch.start + off;
+            if (idx < view.length) {
+                data[idx] = static_cast<std::int32_t>(data[idx] * 2 + 5);
+            }
+        }
+    } else if (view.encoding == runtime::PackedElemEncoding::Int64) {
+        auto* data = static_cast<std::int64_t*>(view.rawData);
+        for (std::size_t off = 0; off < batch.count; ++off) {
+            const std::size_t idx = batch.start + off;
+            if (idx < view.length) {
+                data[idx] = data[idx] * 2 + 5;
+            }
+        }
+    } else {
+        return false;
+    }
+    batch.hasReducedValue = false;
+    batch.reducedValue = runtime::Value{std::monostate{}};
+    return true;
+}
+
+void testGamePackNativeParallelDispatch() {
+    game::GameApi api;
+    auto host = std::make_shared<game::GameplayHost>(60);
+    RS_CHECK(game::installGameplayBindings(api, host));
+    game::GameScriptCompiler compiler(api);
+
+    const std::string src = R"(module Game.NativeParallel;
+
+public void StepScores(int index, int[] scores, int addend) {
+    scores[index] = scores[index] * 2 + addend;
+}
+
+public void StepAotArray(int index, int[] values) {
+    values[index] = values[index] * 2 + 5;
+}
+)";
+    const auto compiled = compiler.compile({{"native_parallel.rscript", src}});
+    RS_CHECK(compiled.succeeded());
+
+    constexpr std::size_t kCount = 96;
+    game::GameEcsParallelOptions opts;
+    opts.workerCount = 4;
+    opts.batchSize = 24;
+    opts.enableNativeBatchKernel = true;
+
+    // 1. StencilJit backend native parallel dispatch
+    {
+        auto rt = game::ScriptRuntime::createIsolated(compiled.program);
+        RS_CHECK(rt.enableStencilJit(true));
+        auto arr = rt.heap()->allocateTypedArray(
+            semantic::stableTypeId("int[]"),
+            semantic::PrimitiveType::Int,
+            0,
+            kCount,
+            runtime::Value{std::int64_t{0}});
+        RS_CHECK(arr.has_value());
+        for (std::size_t i = 0; i < kCount; ++i) {
+            RS_CHECK(rt.heap()->arraySet(*arr, i, runtime::Value{static_cast<std::int64_t>(i)}));
+        }
+
+        rt.resetParallelBatchExecutionCount();
+        const auto res = rt.dispatchEcsParallel(
+            "Game.NativeParallel::StepScores",
+            kCount,
+            {runtime::Value{*arr}, runtime::Value{std::int64_t{7}}},
+            opts);
+        RS_CHECK(res.succeeded && res.totalItemsProcessed == kCount);
+        RS_CHECK(res.usedNativeBatchKernel);
+        RS_CHECK(rt.parallelBatchExecutionCount() > 0);
+        for (std::size_t i = 0; i < kCount; ++i) {
+            const auto v = rt.heap()->arrayGet(*arr, i);
+            RS_CHECK(v.has_value() && std::get<std::int64_t>(*v) == static_cast<std::int64_t>(i * 2 + 7));
+        }
+    }
+
+    // 2. AOT backend native parallel dispatch via ProgramDescriptor
+    {
+        const auto fnSym = compiled.program.program()->findFunction("Game.NativeParallel::StepAotArray");
+        RS_CHECK(fnSym.has_value());
+        static const char* const kModules[] = {"Game.NativeParallel"};
+        static const semantic::PrimitiveType kParams[] = {
+            semantic::PrimitiveType::Int,
+            semantic::PrimitiveType::Array,
+        };
+        const semantic::SymbolId kParamIds[] = {0, semantic::stableTypeId("int[]")};
+        const aot::FunctionDescriptor kFns[] = {
+            {
+                *fnSym,
+                "Game.NativeParallel::StepAotArray",
+                semantic::PrimitiveType::Void,
+                0,
+                kParams,
+                kParamIds,
+                2u,
+                &gamePackAotStepBodiesImpl,
+                nullptr,
+                &gamePackAotStepBodiesBatch,
+            },
+        };
+        const aot::ProgramDescriptor desc{
+            aot::RuntimeAbiMajor,
+            aot::RuntimeAbiMinor,
+            "GamePackParallelAot",
+            0x12345678ULL,
+            kModules,
+            1u,
+            nullptr,
+            0u,
+            kFns,
+            1u,
+        };
+
+        auto rt = game::ScriptRuntime::createIsolated(compiled.program);
+        rt.setAotBackend(&desc);
+        auto arr = rt.heap()->allocateTypedArray(
+            semantic::stableTypeId("int[]"),
+            semantic::PrimitiveType::Int,
+            0,
+            kCount,
+            runtime::Value{std::int64_t{0}});
+        RS_CHECK(arr.has_value());
+        for (std::size_t i = 0; i < kCount; ++i) {
+            RS_CHECK(rt.heap()->arraySet(*arr, i, runtime::Value{static_cast<std::int64_t>(i)}));
+        }
+
+        rt.resetParallelBatchExecutionCount();
+        const auto res = rt.dispatchEcsParallel(
+            "Game.NativeParallel::StepAotArray",
+            kCount,
+            {runtime::Value{*arr}},
+            opts);
+        RS_CHECK(res.succeeded && res.totalItemsProcessed == kCount);
+        RS_CHECK(res.usedNativeBatchKernel);
+        RS_CHECK(rt.parallelBatchExecutionCount() > 0);
+        for (std::size_t i = 0; i < kCount; ++i) {
+            const auto v = rt.heap()->arrayGet(*arr, i);
+            RS_CHECK(v.has_value() && std::get<std::int64_t>(*v) == static_cast<std::int64_t>(i * 2 + 5));
+        }
+    }
+
+    std::cout << "[PASS] AUD-04 GamePack StencilJit and AOT native parallel dispatch\n";
+}
+
 } // namespace
 
-int main() {
+int main() try {
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     testGameApiBindingsAndResourceHandles();
     testRsBindParserPreprocessorAndParity();
     testPackageLoaderAbiAndGameplayStateCodec();
@@ -1329,6 +1689,11 @@ int main() {
     testWave2AStencilJitHotReloadAndDomainIsolation();
     testWave2ARsbsRollbackAndEcsParallelDispatch();
     testCloseoutRegressionSuite();
+    testMacroBuildCacheAndMetadataParity();
+    testGamePackNativeParallelDispatch();
     std::cout << "All app_game_sdk_and_scene_tests passed!\n";
     return 0;
+} catch (const std::exception& ex) {
+    std::cerr << "Unhandled exception: " << ex.what() << std::endl;
+    return 1;
 }

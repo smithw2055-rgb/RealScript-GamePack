@@ -522,6 +522,20 @@ void ScriptRuntime::setDebugger(std::shared_ptr<debug::RuntimeDebugHook> debugge
     }
 }
 
+void ScriptRuntime::syncParallelBatchFactory() const {
+    if (!program_) {
+        return;
+    }
+    if ((backend_ == ScriptExecutionBackend::Aot || backend_ == ScriptExecutionBackend::Jit) &&
+        nativeProgram_) {
+        nativeProgram_->attachToProgramImage(*program_);
+    } else if (backend_ == ScriptExecutionBackend::StencilJit && stencilModule_) {
+        stencilModule_->attachToProgramImage(*program_);
+    } else {
+        program_->setParallelBatchKernelFactory({});
+    }
+}
+
 void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
     stencilJitEnabled_ = false;
     stencilModule_.reset();
@@ -529,6 +543,7 @@ void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
     if (!descriptor) {
         nativeProgram_.reset();
         backend_ = ScriptExecutionBackend::Interpreter;
+        syncParallelBatchFactory();
         return;
     }
     nativeProgram_ = std::make_shared<aot::Program>(*descriptor);
@@ -536,6 +551,7 @@ void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
     nativeProgram_->setHeap(heap_);
     nativeProgram_->setAsyncRuntime(asyncRuntime_);
     backend_ = ScriptExecutionBackend::Aot;
+    syncParallelBatchFactory();
 }
 
 bool ScriptRuntime::enableStencilJit(bool enable, jit::StencilJitOptions options) {
@@ -545,6 +561,7 @@ bool ScriptRuntime::enableStencilJit(bool enable, jit::StencilJitOptions options
         if (backend_ == ScriptExecutionBackend::StencilJit) {
             backend_ = ScriptExecutionBackend::Interpreter;
         }
+        syncParallelBatchFactory();
         return true;
     }
     stencilJitEnabled_ = true;
@@ -564,6 +581,7 @@ bool ScriptRuntime::enableStencilJit(bool enable, jit::StencilJitOptions options
         if (backend_ == ScriptExecutionBackend::StencilJit) {
             backend_ = ScriptExecutionBackend::Interpreter;
         }
+        syncParallelBatchFactory();
         return false;
     }
 
@@ -580,6 +598,7 @@ void ScriptRuntime::setStencilJitBackend(
         if (backend_ == ScriptExecutionBackend::StencilJit) {
             backend_ = ScriptExecutionBackend::Interpreter;
         }
+        syncParallelBatchFactory();
         return;
     }
     stencilJitEnabled_ = true;
@@ -590,6 +609,7 @@ void ScriptRuntime::setStencilJitBackend(
     stencilModule_->setHeap(heap_);
     stencilModule_->setAsyncRuntime(asyncRuntime_);
     backend_ = ScriptExecutionBackend::StencilJit;
+    syncParallelBatchFactory();
 }
 
 void ScriptRuntime::clearNativeBackend() noexcept {
@@ -598,6 +618,27 @@ void ScriptRuntime::clearNativeBackend() noexcept {
     jitModule_.reset();
     nativeProgram_.reset();
     backend_ = ScriptExecutionBackend::Interpreter;
+    syncParallelBatchFactory();
+}
+
+std::size_t ScriptRuntime::parallelBatchExecutionCount() const noexcept {
+    if ((backend_ == ScriptExecutionBackend::Aot || backend_ == ScriptExecutionBackend::Jit) &&
+        nativeProgram_) {
+        return nativeProgram_->parallelBatchExecutionCount();
+    }
+    if (backend_ == ScriptExecutionBackend::StencilJit && stencilModule_) {
+        return stencilModule_->parallelBatchExecutionCount();
+    }
+    return 0;
+}
+
+void ScriptRuntime::resetParallelBatchExecutionCount() noexcept {
+    if (nativeProgram_) {
+        nativeProgram_->resetParallelBatchExecutionCount();
+    }
+    if (stencilModule_) {
+        stencilModule_->resetParallelBatchExecutionCount();
+    }
 }
 
 std::optional<ScriptObject> ScriptRuntime::createAsset(
