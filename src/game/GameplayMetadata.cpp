@@ -623,6 +623,36 @@ std::optional<InspectorTypeSchema> inspectTypeSchema(
 
     std::unordered_set<std::string> visitedStructs;
     std::unordered_set<std::string> recordedSignals;
+    std::string currentCategory;
+    std::string currentGroup;
+    std::string currentSubgroup;
+
+    const auto readStickyLabel = [&](const std::string& fieldName,
+                                     const char* attrName,
+                                     const char* attrFullName,
+                                     const char* primaryArgKey,
+                                     std::string& targetValue) -> bool {
+        const auto* attr = metadata.findMemberAttribute(
+            schema.canonicalTypeName, fieldName, attrName);
+        if (!attr && attrFullName) {
+            attr = metadata.findMemberAttribute(
+                schema.canonicalTypeName, fieldName, attrFullName);
+        }
+        if (!attr) {
+            return false;
+        }
+        for (const char* key : {primaryArgKey, "name", "arg0"}) {
+            const auto it = attr->arguments.find(key);
+            if (it != attr->arguments.end()) {
+                if (const auto* v = std::get_if<std::string>(&it->second)) {
+                    targetValue = *v;
+                    return true;
+                }
+            }
+        }
+        targetValue.clear();
+        return true;
+    };
 
     for (const auto& field : type->descriptor.fields) {
         // Detect synthetic event delegate fields: $event_<SignalName>_delegate
@@ -669,7 +699,31 @@ std::optional<InspectorTypeSchema> inspectTypeSchema(
         }
         if (field.name == "__native" || field.staticField || field.constField) continue;
 
-        schema.fields.push_back(buildInspectorFieldSchema(
+        if (readStickyLabel(
+                field.name,
+                "ExportCategory",
+                "ExportCategoryAttribute",
+                "category",
+                currentCategory)) {
+            currentGroup.clear();
+            currentSubgroup.clear();
+        }
+        if (readStickyLabel(
+                field.name,
+                "ExportGroup",
+                "ExportGroupAttribute",
+                "group",
+                currentGroup)) {
+            currentSubgroup.clear();
+        }
+        (void)readStickyLabel(
+            field.name,
+            "ExportSubgroup",
+            "ExportSubgroupAttribute",
+            "subgroup",
+            currentSubgroup);
+
+        auto builtField = buildInspectorFieldSchema(
             runtime,
             metadata,
             schema.canonicalTypeName,
@@ -677,7 +731,11 @@ std::optional<InspectorTypeSchema> inspectTypeSchema(
             prototype ? &*prototype : nullptr,
             nullptr,
             0,
-            visitedStructs));
+            visitedStructs);
+        builtField.exportCategory = currentCategory;
+        builtField.exportGroup = currentGroup;
+        builtField.exportSubgroup = currentSubgroup;
+        schema.fields.push_back(std::move(builtField));
     }
 
     return schema;

@@ -141,6 +141,9 @@ struct InspectorFieldSchema {
     std::optional<std::int64_t> rangeMax;
     std::string tooltip;
     std::string formerlySerializedAs;
+    std::string exportCategory;
+    std::string exportGroup;
+    std::string exportSubgroup;
     InspectorReferenceKind referenceKind = InspectorReferenceKind::None;
     std::string referencedTypeName;
     bool isCollection = false;

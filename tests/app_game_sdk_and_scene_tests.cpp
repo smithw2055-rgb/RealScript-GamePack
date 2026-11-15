@@ -1021,6 +1021,301 @@ public void StepBodies(int index, BodyPos[] positions, BodyVel[] velocities) {
     std::cout << "[PASS] Wave 2A: RSBS binary rollback snapshot, eff_3 preservation & ECS parallel dispatch\n";
 }
 
+void testCloseoutRegressionSuite() {
+    runtime::RuntimeError err;
+
+    // 1. eff_1: suspended sequence coroutine preservation across SceneScriptRuntime::hotReload
+    {
+        game::GameApi seqApi;
+        auto host = std::make_shared<game::GameplayHost>(60);
+        RS_CHECK(game::installGameplayBindings(seqApi, host));
+
+        const std::string seqSrcV1 = R"(module Game.CloseoutSeq;
+import RealScript.Game;
+
+public class SeqWorker {
+    public int stage = 0;
+
+    public sequence WorkFlow(long target) {
+        stage = 10;
+        yield wait_ticks(3);
+        stage = 99;
+    }
+}
+)";
+        const std::string seqSrcV2 = R"(module Game.CloseoutSeq;
+import RealScript.Game;
+
+public class SeqWorker {
+    public int stage = 0;
+    public int bonus = 7;
+
+    public sequence WorkFlow(long target) {
+        stage = 10;
+        yield wait_ticks(3);
+        stage = 99;
+    }
+}
+)";
+        const auto v1 = compileGameScript(seqApi, {{"closeout_seq.rscript", seqSrcV1}});
+        const auto v2 = compileGameScript(seqApi, {{"closeout_seq.rscript", seqSrcV2}});
+
+        game::ScriptRuntime rt(v1.program);
+        game::SceneScriptRuntime scene(rt);
+        game::SceneGameplayDriver driver(scene, host);
+
+        constexpr game::SceneEntityId kSeqEnt = 1;
+        RS_CHECK(scene.attachComponent(kSeqEnt, "Game.CloseoutSeq::SeqWorker"));
+        scene.start();
+
+        auto* workerV1 = scene.getComponent(kSeqEnt, "Game.CloseoutSeq::SeqWorker");
+        RS_CHECK(workerV1 != nullptr);
+        const auto startWork = rt.findMethod(workerV1->type(), "WorkFlow", 1);
+        RS_CHECK(startWork.has_value());
+        const auto startRes = rt.invoke(*workerV1, *startWork, {runtime::Value{runtime::LongValue{1}}});
+        if (!startRes.succeeded) {
+            std::cerr << "WorkFlow start failed: " << startRes.error.message << '\n';
+        }
+        RS_CHECK(startRes.succeeded);
+
+        const auto midStage = rt.getMember(*workerV1, "stage", err);
+        RS_CHECK(midStage.has_value() && std::get<std::int64_t>(*midStage) == 10);
+
+        const auto reloadRep = scene.hotReload(v2.program);
+        RS_CHECK(reloadRep.succeeded);
+        RS_CHECK(reloadRep.preservedCoroutines >= 1u);
+        RS_CHECK(reloadRep.abortedCoroutines == 0u);
+
+        (void)driver.advanceTicks(4u);
+        RS_CHECK(driver.errors().empty());
+
+        auto* workerV2 = scene.getComponent(kSeqEnt, "Game.CloseoutSeq::SeqWorker");
+        RS_CHECK(workerV2 != nullptr);
+        const auto stageAfter = rt.getMember(*workerV2, "stage", err);
+        const auto bonusAfter = rt.getMember(*workerV2, "bonus", err);
+        RS_CHECK(stageAfter.has_value() && std::get<std::int64_t>(*stageAfter) == 99);
+        RS_CHECK(bonusAfter.has_value() && std::get<std::int64_t>(*bonusAfter) == 7);
+
+        // 2. eff_3: serializePrefabText / deserializePrefabText + instantiatePrefab rootMemberOverrides merge
+        game::AssetGuidRegistry guids;
+        guids.populateFromProgram(v2.program);
+
+        game::PrefabNodeTemplate prefabRoot;
+        prefabRoot.name = "TurretRoot";
+        prefabRoot.localTransform.position = {
+            game::Fixed::fromInt(4), game::Fixed::fromInt(5), game::Fixed::fromInt(6)};
+        game::PrefabComponentTemplate rootComp;
+        rootComp.scriptType = "Game.CloseoutSeq::SeqWorker";
+        rootComp.options.initialMembers["stage"] = runtime::Value{std::int64_t{42}};
+        prefabRoot.components.push_back(std::move(rootComp));
+
+        game::PrefabNodeTemplate childPrefab;
+        childPrefab.name = "Barrel";
+        childPrefab.localTransform.position = {
+            game::Fixed::fromInt(1), game::Fixed::fromInt(0), game::Fixed::fromInt(0)};
+        prefabRoot.children.push_back(std::move(childPrefab));
+
+        const std::string prefabText = game::serializePrefabText(prefabRoot, err, &guids, &rt);
+        RS_CHECK(!prefabText.empty());
+        const auto decodedPrefab = game::deserializePrefabText(prefabText, err, &guids, &rt);
+        RS_CHECK(decodedPrefab.has_value());
+        RS_CHECK(decodedPrefab->name == "TurretRoot");
+        RS_CHECK(decodedPrefab->children.size() == 1u && decodedPrefab->children[0].name == "Barrel");
+
+        game::SceneEntityId nextEntityId = 100u;
+        const std::map<std::string, runtime::Value> overrides{
+            {"stage", runtime::Value{std::int64_t{777}}}};
+        const game::SceneEntityId spawnedRoot =
+            scene.instantiatePrefab(*decodedPrefab, nextEntityId, 0u, overrides);
+        RS_CHECK(spawnedRoot == 100u && nextEntityId == 102u);
+
+        auto* spawnedComp = scene.getComponent(spawnedRoot, "Game.CloseoutSeq::SeqWorker");
+        RS_CHECK(spawnedComp != nullptr);
+        const auto overriddenStage = rt.getMember(*spawnedComp, "stage", err);
+        RS_CHECK(overriddenStage.has_value() && std::get<std::int64_t>(*overriddenStage) == 777);
+        RS_CHECK(scene.getParent(101u) == spawnedRoot);
+        RS_CHECK(scene.getWorldTransform(101u).position.x.toIntFloor() == 5);
+    }
+
+    // 3. perf_4: lifecycleHotPathStats, 4. Physics3D, 5. ECS deferred command buffer
+    {
+        const std::string perfSrc = R"(module Game.PerfHotPath;
+
+public struct EcsTag {
+    public int code;
+}
+
+public class TagFactory {
+    public static EcsTag Make(int c) {
+        var t = new EcsTag();
+        t.code = c;
+        return t;
+    }
+}
+
+public class TickCounter {
+    public int updates = 0;
+    public int fixedUpdates = 0;
+    public int collisions3D = 0;
+
+    public void OnUpdate(double dt) {
+        updates = updates + 1;
+    }
+
+    public void OnFixedUpdate(double dt) {
+        fixedUpdates = fixedUpdates + 1;
+    }
+
+    public void OnCollisionEnter3D(long other) {
+        collisions3D = collisions3D + 1;
+    }
+}
+)";
+        game::GameApi perfApi;
+        const auto perfCompiled = compileGameScript(perfApi, {{"perf_hot.rscript", perfSrc}});
+        auto perfRt = game::ScriptRuntime::createIsolated(perfCompiled.program);
+        game::SceneScriptRuntime perfScene(perfRt);
+
+        RS_CHECK(perfScene.attachComponent(1u, "Game.PerfHotPath::TickCounter"));
+        RS_CHECK(perfScene.attachComponent(2u, "Game.PerfHotPath::TickCounter"));
+        perfScene.start();
+        perfScene.resetLifecycleHotPathStats();
+
+        perfScene.update(0.016);
+        perfScene.update(0.016);
+        perfScene.fixedUpdate(0.016);
+
+        const auto hotStats = perfScene.lifecycleHotPathStats();
+        RS_CHECK(hotStats.cacheRebuilds == 1u);
+        RS_CHECK(hotStats.cacheHits == 2u);
+        RS_CHECK(hotStats.activeCachedComponents == 2u);
+        RS_CHECK(hotStats.cachedUpdateSlots == 2u);
+        RS_CHECK(hotStats.cachedFixedUpdateSlots == 2u);
+        RS_CHECK((hotStats.fastDispatchedCallbacks + hotStats.fallbackDispatchedCallbacks) == 6u);
+
+        // Physics3D: stepPhysics3D, getCollisionContact3D, raycast3D, overlapSphere3D
+        game::Transform3D t10{};
+        t10.position = {game::Fixed::fromInt(0), game::Fixed::fromInt(0), game::Fixed::fromInt(0)};
+        game::Transform3D t11{};
+        t11.position = {game::Fixed::fromInt(1), game::Fixed::fromInt(0), game::Fixed::fromInt(0)};
+        perfScene.setLocalTransform(10u, t10);
+        perfScene.setLocalTransform(11u, t11);
+
+        RS_CHECK(perfScene.attachComponent(10u, "Game.PerfHotPath::TickCounter"));
+        perfScene.start();
+
+        game::SceneCollider3D sph{};
+        sph.isSphere = true;
+        sph.radius = game::Fixed::fromInt(1);
+        perfScene.setEntityCollider3D(10u, sph);
+        perfScene.setEntityCollider3D(11u, sph);
+
+        RS_CHECK(perfScene.stepPhysics3D() >= 1u);
+        const auto contact3D = perfScene.getCollisionContact3D(10u, 11u);
+        RS_CHECK(contact3D.has_value() && contact3D->penetration.raw > 0);
+
+        const auto rayHit3D = perfScene.raycast3D(
+            game::Vec3{game::Fixed::fromInt(-5), game::Fixed::fromInt(0), game::Fixed::fromInt(0)},
+            game::Vec3{game::Fixed::fromInt(1), game::Fixed::fromInt(0), game::Fixed::fromInt(0)},
+            game::Fixed::fromInt(20));
+        RS_CHECK(rayHit3D.has_value() && rayHit3D->entity == 10u);
+
+        const auto sphereHits3D = perfScene.overlapSphere3D(
+            game::Vec3{game::Fixed::fromInt(0), game::Fixed::fromInt(0), game::Fixed::fromInt(0)},
+            game::Fixed::fromInt(2));
+        RS_CHECK(sphereHits3D.size() == 2u);
+
+        // ECS command buffer: queueEcsSetComponent / RemoveComponent / DestroyEntity / flushEcsCommandBuffer
+        const auto factoryType = perfRt.findType("Game.PerfHotPath::TagFactory");
+        RS_CHECK(factoryType.has_value());
+        const auto makeFn = perfRt.findMethod(*factoryType, "Make", 1u);
+        RS_CHECK(makeFn.has_value());
+        const auto tagRes = perfRt.invokeStatic(*makeFn, {runtime::Value{std::int64_t{42}}});
+        RS_CHECK(tagRes.succeeded);
+
+        perfRt.queueEcsSetComponent(501u, "Game.PerfHotPath::EcsTag", tagRes.value);
+        perfRt.queueEcsSetComponent(502u, "Game.PerfHotPath::EcsTag", tagRes.value);
+        RS_CHECK(perfRt.pendingEcsCommandCount() == 2u);
+        RS_CHECK(perfRt.flushEcsCommandBuffer(err) == 2u);
+        RS_CHECK(perfRt.pendingEcsCommandCount() == 0u);
+        RS_CHECK(perfRt.hasEcsEntityComponent(501u, "Game.PerfHotPath::EcsTag"));
+        RS_CHECK(perfRt.hasEcsEntityComponent(502u, "Game.PerfHotPath::EcsTag"));
+
+        perfRt.queueEcsRemoveComponent(501u, "Game.PerfHotPath::EcsTag");
+        perfRt.queueEcsDestroyEntity(502u);
+        RS_CHECK(perfRt.pendingEcsCommandCount() == 2u);
+        RS_CHECK(perfRt.flushEcsCommandBuffer(err) == 2u);
+        RS_CHECK(!perfRt.hasEcsEntityComponent(501u, "Game.PerfHotPath::EcsTag"));
+        RS_CHECK(!perfRt.hasEcsEntityComponent(502u, "Game.PerfHotPath::EcsTag"));
+    }
+
+    // 6. [ExportCategory] / [ExportGroup] / [ExportSubgroup] sticky Inspector grouping
+    {
+        const std::string groupingSrc = R"(module Game.InspectorGrouping;
+
+public class GroupedActor {
+    [ExportCategory("Combat")]
+    [ExportGroup("PrimaryWeapon")]
+    [ExportSubgroup("Ammo")]
+    [Export]
+    public int clipSize = 30;
+
+    [Export]
+    public int reserveAmmo = 120;
+
+    [ExportGroup("SecondaryWeapon")]
+    [Export]
+    public int sidearmClip = 12;
+
+    [ExportCategory("Movement")]
+    [Export]
+    public int walkSpeed = 5;
+}
+)";
+        game::GameApi grpApi;
+        const auto grpCompiled = compileGameScript(grpApi, {{"grouping.rscript", groupingSrc}});
+        game::ScriptMetadataRegistry grpMeta;
+        (void)grpMeta.populateFromProgram(grpCompiled.program);
+        auto grpRt = game::ScriptRuntime::createIsolated(grpCompiled.program);
+
+        const auto schema = game::inspectTypeSchema(
+            grpRt, grpMeta, "Game.InspectorGrouping::GroupedActor");
+        RS_CHECK(schema.has_value());
+
+        const auto findField = [&](std::string_view fieldName) -> const game::InspectorFieldSchema* {
+            for (const auto& f : schema->fields) {
+                if (f.name == fieldName) return &f;
+            }
+            return nullptr;
+        };
+
+        const auto* clipSize = findField("clipSize");
+        const auto* reserveAmmo = findField("reserveAmmo");
+        const auto* sidearmClip = findField("sidearmClip");
+        const auto* walkSpeed = findField("walkSpeed");
+        RS_CHECK(clipSize != nullptr && reserveAmmo != nullptr &&
+                 sidearmClip != nullptr && walkSpeed != nullptr);
+
+        RS_CHECK(clipSize->exportCategory == "Combat");
+        RS_CHECK(clipSize->exportGroup == "PrimaryWeapon");
+        RS_CHECK(clipSize->exportSubgroup == "Ammo");
+
+        RS_CHECK(reserveAmmo->exportCategory == "Combat");
+        RS_CHECK(reserveAmmo->exportGroup == "PrimaryWeapon");
+        RS_CHECK(reserveAmmo->exportSubgroup == "Ammo");
+
+        RS_CHECK(sidearmClip->exportCategory == "Combat");
+        RS_CHECK(sidearmClip->exportGroup == "SecondaryWeapon");
+        RS_CHECK(sidearmClip->exportSubgroup.empty());
+
+        RS_CHECK(walkSpeed->exportCategory == "Movement");
+        RS_CHECK(walkSpeed->exportGroup.empty());
+        RS_CHECK(walkSpeed->exportSubgroup.empty());
+    }
+
+    std::cout << "[PASS] Closeout regression suite (eff_1 sequence hot-reload, eff_3 prefab text, perf_4, Physics3D, ECS cmd buffer & Inspector grouping)\n";
+}
+
 } // namespace
 
 int main() {
@@ -1033,6 +1328,7 @@ int main() {
     testWave2ACompilerOptMacrosCacheIdeExportAndSignals();
     testWave2AStencilJitHotReloadAndDomainIsolation();
     testWave2ARsbsRollbackAndEcsParallelDispatch();
+    testCloseoutRegressionSuite();
     std::cout << "All app_game_sdk_and_scene_tests passed!\n";
     return 0;
 }
