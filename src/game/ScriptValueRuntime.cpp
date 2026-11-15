@@ -180,11 +180,17 @@ runtime::ExecutionResult ScriptRuntime::invokeSymbol(
             runtime::ErrorCode::InvalidProgram,
             "script runtime has no linked program image");
     }
+    runtime::ScopedValuePoolDomain domainScope(heap_ ? heap_->valuePoolDomain().get() : nullptr);
     if (!options.debugger && debugger_) {
         options.debugger = debugger_;
     }
-    if (!options.debugger && nativeProgram_ && backend_ != ScriptExecutionBackend::Interpreter) {
-        if (nativeProgram_->hasFunction(symbolId)) {
+    if (!options.debugger) {
+        if (backend_ == ScriptExecutionBackend::StencilJit &&
+            stencilModule_ && stencilModule_->valid()) {
+            return stencilModule_->invoke(symbolId, arguments, std::move(options));
+        }
+        if (nativeProgram_ && backend_ != ScriptExecutionBackend::Interpreter &&
+            nativeProgram_->hasFunction(symbolId)) {
             return nativeProgram_->invoke(symbolId, arguments, std::move(options));
         }
     }
@@ -867,6 +873,117 @@ std::size_t ScriptRuntime::flushEcsCommandBuffer(runtime::RuntimeError& error) c
         }
     }
     return executed;
+}
+
+namespace {
+
+runtime::ParallelJobConfig buildParallelJobConfig(const GameEcsParallelOptions& options) {
+    runtime::ParallelJobConfig cfg;
+    cfg.workerCount = options.workerCount;
+    cfg.batchSize = options.batchSize > 0 ? options.batchSize : 64;
+    cfg.allowRawColumnArrays = options.allowRawColumnArrays;
+    cfg.allowReadOnlyStaticColumnLoads = options.allowReadOnlyStaticColumnLoads;
+    cfg.enableNativeBatchKernel = options.enableNativeBatchKernel;
+    cfg.nativeBatchKernel = options.nativeBatchKernel;
+    cfg.pureExternalNames = options.pureExternalNames;
+    cfg.executionOptions = options.executionOptions;
+    return cfg;
+}
+
+} // namespace
+
+std::optional<runtime::ObjectRef> ScriptRuntime::getEcsColumnRef(
+    const std::string& canonicalTypeName) const {
+    if (!heap_ || canonicalTypeName.empty()) return std::nullopt;
+    const auto resolveByName = [&](const std::string& name) -> std::optional<runtime::ObjectRef> {
+        const auto colSymbolId = semantic::stableTypeId("$ecs_column::" + name);
+        const auto val = heap_->getStaticField(colSymbolId);
+        if (!val) return std::nullopt;
+        const auto* ref = std::get_if<runtime::ObjectRef>(&*val);
+        if (!ref || !ref->valid()) return std::nullopt;
+        return *ref;
+    };
+    if (const auto type = findType(canonicalTypeName)) {
+        if (auto found = resolveByName(type->canonicalName())) return found;
+    }
+    return resolveByName(canonicalTypeName);
+}
+
+runtime::ParallelJobVerificationReport ScriptRuntime::verifyEcsParallelFunction(
+    const runtime::ProgramImage& program,
+    const std::string& qualifiedFunctionName,
+    const GameEcsParallelOptions& options) {
+    runtime::ParallelJobVerifyOptions verifyOpts;
+    verifyOpts.pureExternalNames = options.pureExternalNames;
+    verifyOpts.allowRawColumnArrays = options.allowRawColumnArrays;
+    verifyOpts.allowReadOnlyStaticColumnLoads = options.allowReadOnlyStaticColumnLoads;
+    return runtime::verifyParallelJobFunction(program, qualifiedFunctionName, verifyOpts);
+}
+
+runtime::ParallelJobResult ScriptRuntime::dispatchEcsParallel(
+    const std::string& qualifiedFunctionName,
+    std::size_t elementCount,
+    const std::vector<runtime::Value>& arguments,
+    const GameEcsParallelOptions& options) const {
+    runtime::ParallelJobResult result;
+    if (!program_ || !heap_) {
+        result.error.code = runtime::ErrorCode::InvalidProgram;
+        result.error.message = "script runtime has no linked program image or managed heap";
+        return result;
+    }
+    runtime::ScopedValuePoolDomain domainScope(heap_->valuePoolDomain().get());
+    if (!parallelScheduler_ ||
+        (options.workerCount != 0 && parallelSchedulerWorkers_ != options.workerCount)) {
+        parallelScheduler_ = std::make_shared<runtime::ParallelJobScheduler>(options.workerCount);
+        parallelSchedulerWorkers_ = options.workerCount;
+    }
+    const auto cfg = buildParallelJobConfig(options);
+    if (options.dispatchRangeMode) {
+        return parallelScheduler_->dispatchRange(
+            program_,
+            heap_,
+            qualifiedFunctionName,
+            elementCount,
+            arguments,
+            cfg,
+            bindings_);
+    }
+    return parallelScheduler_->dispatchFor(
+        program_,
+        heap_,
+        qualifiedFunctionName,
+        elementCount,
+        arguments,
+        cfg,
+        bindings_);
+}
+
+runtime::ParallelJobResult ScriptRuntime::dispatchEcsParallelColumns(
+    const std::string& qualifiedFunctionName,
+    std::size_t elementCount,
+    const std::vector<std::string>& columnTypeNames,
+    const std::vector<runtime::Value>& trailingArguments,
+    const GameEcsParallelOptions& options) const {
+    runtime::ParallelJobResult result;
+    if (!program_ || !heap_) {
+        result.error.code = runtime::ErrorCode::InvalidProgram;
+        result.error.message = "script runtime has no linked program image or managed heap";
+        return result;
+    }
+    std::vector<runtime::Value> fullArgs;
+    fullArgs.reserve(columnTypeNames.size() + trailingArguments.size());
+    for (const auto& colType : columnTypeNames) {
+        const auto colRef = getEcsColumnRef(colType);
+        if (!colRef) {
+            result.error.code = runtime::ErrorCode::TypeMismatch;
+            result.error.message =
+                "ECS component column '" + colType + "' is not bound in runtime heap";
+            return result;
+        }
+        fullArgs.emplace_back(*colRef);
+    }
+    fullArgs.insert(fullArgs.end(), trailingArguments.begin(), trailingArguments.end());
+    return dispatchEcsParallel(qualifiedFunctionName, elementCount, fullArgs, options);
 }
 
 } // namespace realscript::game

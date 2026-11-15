@@ -1,19 +1,45 @@
 #pragma once
 
 #include "realscript/aot_cpp/AotRuntime.h"
-#include "realscript/debug/DapServer.h"
 #include "realscript/game/GameBindings.h"
-#include "realscript/jit/Jit.h"
+#include "realscript/jit/StencilJit.h"
 #include "realscript/runtime/FiberScheduler.h"
+#include "realscript/runtime/ParallelJob.h"
+
+#include <functional>
+#include <unordered_set>
+
+namespace realscript::jit {
+class Module;
+} // namespace realscript::jit
+
+namespace realscript::debug {
+class RuntimeDebugHook;
+class EmbeddedDapServer;
+} // namespace realscript::debug
 
 namespace realscript::game {
 
+class GameScriptCompiler;
 class ScriptMetadataRegistry;
 
 enum class ScriptExecutionBackend {
     Interpreter,
+    StencilJit,
     Jit,
     Aot,
+};
+
+struct GameEcsParallelOptions {
+    std::size_t workerCount = 0;
+    std::size_t batchSize = 64;
+    bool allowRawColumnArrays = true;
+    bool allowReadOnlyStaticColumnLoads = true;
+    bool enableNativeBatchKernel = true;
+    runtime::ParallelNativeBatchKernel nativeBatchKernel{};
+    std::unordered_set<std::string> pureExternalNames{};
+    runtime::ExecutionOptions executionOptions{};
+    bool dispatchRangeMode = false;
 };
 
 enum class SceneExecutionMode {
@@ -40,10 +66,14 @@ public:
     [[nodiscard]] static GameProgram fromProgramImage(
         std::shared_ptr<const runtime::ProgramImage> program,
         std::shared_ptr<const runtime::BindingRegistry> bindings = nullptr,
-        GameLanguageMetadata languageMetadata = {}) {
+        GameLanguageMetadata languageMetadata = {},
+        std::shared_ptr<runtime::ManagedHeap> heap = nullptr,
+        std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles = nullptr) {
         GameProgram gp;
         gp.program_ = std::move(program);
         gp.bindings_ = std::move(bindings);
+        gp.heap_ = std::move(heap);
+        gp.nativeHandles_ = std::move(nativeHandles);
         gp.languageMetadata_ = std::move(languageMetadata);
         return gp;
     }
@@ -72,28 +102,6 @@ private:
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles_;
     GameLanguageMetadata languageMetadata_;
-};
-
-struct GameCompileResult {
-    GameProgram program;
-    std::vector<bytecode::Module> modules;
-    diagnostics::DiagnosticBag diagnostics;
-    GameLanguageMetadata languageMetadata;
-
-    [[nodiscard]] bool succeeded() const noexcept {
-        return program.valid() && !diagnostics.hasErrors();
-    }
-};
-
-class GameScriptCompiler {
-public:
-    explicit GameScriptCompiler(const GameApi& api) : api_(api) {}
-
-    [[nodiscard]] GameCompileResult compile(
-        const std::vector<compiler::SourceFile>& sources) const;
-
-private:
-    const GameApi& api_;
 };
 
 struct ScriptType {
@@ -134,6 +142,7 @@ public:
 
 private:
     friend class ScriptRuntime;
+    friend class SceneScriptRuntime;
     ScriptObject(
         ScriptType type,
         runtime::ObjectRef reference,
@@ -366,12 +375,23 @@ public:
         semantic::SymbolId expectedTypeId) const noexcept;
     void replaceProgram(const GameProgram& program);
 
+    [[nodiscard]] static ScriptRuntime createIsolated(const GameProgram& program);
+    [[nodiscard]] std::shared_ptr<runtime::ValuePoolDomain> valuePoolDomain() const noexcept;
+
     void setAotBackend(const aot::ProgramDescriptor* descriptor);
+    bool enableStencilJit(bool enable = true, jit::StencilJitOptions options = {});
+    void setStencilJitBackend(
+        std::shared_ptr<jit::StencilModule> stencilModule,
+        jit::StencilJitOptions options = {});
+    [[nodiscard]] bool stencilJitEnabled() const noexcept { return stencilJitEnabled_; }
+    [[nodiscard]] const std::shared_ptr<jit::StencilModule>& stencilModule() const noexcept {
+        return stencilModule_;
+    }
     void setJitBackend(std::shared_ptr<jit::Module> jitModule);
     void clearNativeBackend() noexcept;
 
-    void setDebugger(std::shared_ptr<debug::DebugController> debugger) noexcept;
-    [[nodiscard]] std::shared_ptr<debug::DebugController> debugger() const noexcept {
+    void setDebugger(std::shared_ptr<debug::RuntimeDebugHook> debugger) noexcept;
+    [[nodiscard]] std::shared_ptr<debug::RuntimeDebugHook> debugger() const noexcept {
         return debugger_;
     }
     bool startRemoteDebugger(
@@ -551,6 +571,24 @@ public:
     }
     std::size_t flushEcsCommandBuffer(runtime::RuntimeError& error) const;
 
+    [[nodiscard]] std::optional<runtime::ObjectRef> getEcsColumnRef(
+        const std::string& canonicalTypeName) const;
+    [[nodiscard]] static runtime::ParallelJobVerificationReport verifyEcsParallelFunction(
+        const runtime::ProgramImage& program,
+        const std::string& qualifiedFunctionName,
+        const GameEcsParallelOptions& options = {});
+    [[nodiscard]] runtime::ParallelJobResult dispatchEcsParallel(
+        const std::string& qualifiedFunctionName,
+        std::size_t elementCount,
+        const std::vector<runtime::Value>& arguments = {},
+        const GameEcsParallelOptions& options = {}) const;
+    [[nodiscard]] runtime::ParallelJobResult dispatchEcsParallelColumns(
+        const std::string& qualifiedFunctionName,
+        std::size_t elementCount,
+        const std::vector<std::string>& columnTypeNames,
+        const std::vector<runtime::Value>& trailingArguments = {},
+        const GameEcsParallelOptions& options = {}) const;
+
     // P1-4: Reusable Scriptable Data Assets (ScriptableObject / Resource parity)
     [[nodiscard]] std::optional<ScriptObject> createAsset(
         const std::string& assetPath,
@@ -617,6 +655,7 @@ private:
         semantic::SymbolId symbolId,
         const std::vector<runtime::Value>& arguments,
         runtime::ExecutionOptions options) const;
+    void applyProgramSidecarBindings() noexcept;
 
     std::shared_ptr<const runtime::ProgramImage> program_;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
@@ -625,10 +664,18 @@ private:
     std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
     runtime::Interpreter interpreter_;
     ScriptExecutionBackend backend_ = ScriptExecutionBackend::Interpreter;
+    bool stencilJitEnabled_ = false;
+    jit::StencilJitOptions stencilJitOptions_{};
+    std::shared_ptr<jit::StencilModule> stencilModule_;
     std::shared_ptr<jit::Module> jitModule_;
     std::shared_ptr<aot::Program> nativeProgram_;
-    std::shared_ptr<debug::DebugController> debugger_;
+    std::shared_ptr<debug::RuntimeDebugHook> debugger_;
     std::shared_ptr<debug::EmbeddedDapServer> remoteDebugger_;
+    std::function<void(
+        const std::shared_ptr<debug::EmbeddedDapServer>&,
+        const std::shared_ptr<const runtime::ProgramImage>&)> remoteDebuggerRebind_;
+    mutable std::shared_ptr<runtime::ParallelJobScheduler> parallelScheduler_;
+    mutable std::size_t parallelSchedulerWorkers_ = 0;
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -1008,6 +1055,15 @@ public:
         const std::string& targetMethod);
     [[nodiscard]] const std::vector<SignalConnection>& signalConnections() const noexcept {
         return signalConnections_;
+    }
+    [[nodiscard]] runtime::ParallelJobResult dispatchEcsParallel(
+        const std::string& qualifiedFunctionName,
+        std::size_t elementCount,
+        const std::vector<std::string>& columnTypeNames,
+        const std::vector<runtime::Value>& trailingArguments = {},
+        const GameEcsParallelOptions& options = {}) const {
+        return runtime_.dispatchEcsParallelColumns(
+            qualifiedFunctionName, elementCount, columnTypeNames, trailingArguments, options);
     }
     std::size_t emitSignal(
         SceneEntityId sourceEntity,

@@ -3,6 +3,9 @@
 #include "realscript/game/DeterministicMath.h"
 #include "realscript/game/GameBindings.h"
 #include "realscript/game/GameProductization.h"
+#include "realscript/game/GameScriptCompiler.h"
+#include <chrono>
+#include <filesystem>
 #include "realscript/game/GameScripting.h"
 #include "realscript/game/GameplayMetadata.h"
 #include "realscript/game/GameplayPrimitives.h"
@@ -572,6 +575,452 @@ public class HeroStats {
     std::cout << "[PASS] Pillar 6: SceneLifecycleRuntime & GameplayStateCodec [FieldTag]/multi-[FormerlySerializedAs] migration\n";
 }
 
+struct HostBodyPos {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+};
+static_assert(std::is_standard_layout_v<HostBodyPos>);
+
+struct HostBodyVel {
+    std::int64_t dx = 0;
+    std::int64_t dy = 0;
+};
+static_assert(std::is_standard_layout_v<HostBodyVel>);
+
+void testWave2ACompilerOptMacrosCacheIdeExportAndSignals() {
+    namespace fs = std::filesystem;
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path tempRoot = fs::temp_directory_path() / ("rs_gp_w2a_" + std::to_string(nonce));
+    const fs::path cacheDir = tempRoot / "build_cache";
+    const fs::path ideDir = tempRoot / "ide_meta";
+    fs::create_directories(cacheDir);
+    fs::create_directories(ideDir);
+
+    game::GameApi api;
+    (void)api.function(
+        "Game.Native",
+        "BonusDamage",
+        [](std::int64_t base) -> std::int64_t { return base + 7; });
+
+    // 1. StandardMacros ([Signal] + [RelayCommand]) + -O2 + CompilerSession reuse + IDE metadata export + C++/Script Signal interop
+    {
+        const std::string reactiveSrc = R"(module Game.Wave2ASignals;
+
+public partial class CombatEmitter {
+    public int hitsTaken = 0;
+    public int uiPingCount = 0;
+    public bool attackReady = false;
+    public int attackDamage = 0;
+    public int scriptSignalSeenHp = 0;
+
+    [Signal]
+    public partial void HealthChanged(int hp, string status);
+
+    [RelayCommand(CanExecute = "CanAttack")]
+    public void Attack(int power) {
+        this.attackDamage = this.attackDamage + power;
+    }
+
+    private bool CanAttack(int power) {
+        return this.attackReady && power > 0;
+    }
+
+    [RelayCommand]
+    public void UiPing() {
+        this.uiPingCount = this.uiPingCount + 1;
+    }
+
+    public bool CheckAttackCommand(int power) {
+        return this.AttackCommand.CanExecute(power);
+    }
+
+    public void ExecAttackCommand(int power) {
+        this.AttackCommand.Execute(power);
+    }
+
+    public void ExecUiPingCommand() {
+        this.UiPingCommand.Execute();
+    }
+
+    public void EmitFromScript(int hp, string status) {
+        this.HealthChanged(hp, status);
+    }
+
+    public void BindScriptListener() {
+        CombatEmitter__HealthChangedSignalHandler handler = (int hp, string status) => {
+            this.scriptSignalSeenHp = this.scriptSignalSeenHp + hp;
+        };
+        this.HealthChangedEvent += handler;
+    }
+}
+
+public class CombatListener {
+    public int receivedHp = 0;
+    public string lastStatus = "";
+
+    public void OnHealthChanged(int hp, string status) {
+        this.receivedHp = this.receivedHp + hp;
+        this.lastStatus = status;
+    }
+}
+)";
+        game::GameScriptCompiler compiler(api);
+        game::GameCompileOptions opts;
+        opts.optimizationLevel = game::GameOptimizationLevel::O2;
+        opts.enableStandardReactiveMacros = true;
+        opts.preferBuildCache = false;
+        opts.enableIncrementalBuildSnapshot = true;
+        opts.ideMetadataOutputDirectory = ideDir;
+        opts.projectName = "Wave2ATestProj";
+        opts.extraProjectSourcePaths = {"scripts/Combat.rscript"};
+
+        const auto c1 = compiler.compile({{"Combat.rscript", reactiveSrc}}, opts);
+        RS_CHECK(c1.succeeded());
+        RS_CHECK(c1.sessionParsedUnitCacheSize >= 1u);
+        RS_CHECK(!c1.ideMetadata.declarationStubs.empty());
+        RS_CHECK(c1.ideMetadata.projectConfigJson.find("Wave2ATestProj") != std::string::npos);
+        RS_CHECK(c1.ideMetadata.writtenFiles.size() >= 2u);
+        RS_CHECK(fs::exists(ideDir / "realscript.project.json"));
+        bool foundStub = false;
+        for (const auto& f : c1.ideMetadata.writtenFiles) {
+            if (f.extension() == ".rscript" || f.filename().string().find(".d.rscript") != std::string::npos) {
+                foundStub = foundStub || fs::exists(f);
+            }
+        }
+        RS_CHECK(foundStub);
+
+        // Incremental session reuse compile
+        const auto c2 = compiler.compile({{"Combat.rscript", reactiveSrc}}, opts);
+        RS_CHECK(c2.succeeded());
+        RS_CHECK(c2.sessionParsedUnitCacheSize >= 1u);
+
+        auto rt = game::ScriptRuntime::createIsolated(c1.program);
+        game::SceneScriptRuntime scene(rt);
+        const auto emitterEnt = scene.spawnGenerationalEntity("Emitter");
+        const auto listenerEnt = scene.spawnGenerationalEntity("Listener");
+        RS_CHECK(scene.attachComponent(emitterEnt, "Game.Wave2ASignals::CombatEmitter"));
+        RS_CHECK(scene.attachComponent(listenerEnt, "Game.Wave2ASignals::CombatListener"));
+
+        // Wire scene signal using bare [Signal] method name ("HealthChanged")
+        RS_CHECK(scene.connectSignal(
+            emitterEnt, "CombatEmitter", "HealthChanged",
+            listenerEnt, "CombatListener", "OnHealthChanged"));
+
+        auto* emitterObj = scene.getComponent(emitterEnt, "Game.Wave2ASignals::CombatEmitter");
+        auto* listenerObj = scene.getComponent(listenerEnt, "Game.Wave2ASignals::CombatListener");
+        RS_CHECK(emitterObj != nullptr && listenerObj != nullptr);
+
+        // 1) Script invokes [Signal] -> C++ connected Scene signal target fires
+        const auto callMethod = [&](const game::ScriptObject& obj,
+                                    const std::string& methodName,
+                                    std::vector<runtime::Value> args = {}) {
+            const auto method = rt.findMethod(obj.type(), methodName, args.size());
+            RS_CHECK(method.has_value());
+            return rt.invoke(obj, *method, std::move(args));
+        };
+        const auto emitFromScriptRes = callMethod(
+            *emitterObj,
+            "EmitFromScript",
+            {runtime::Value{std::int64_t{45}}, runtime::Value{std::string{"hit"}}});
+        RS_CHECK(emitFromScriptRes.succeeded);
+        runtime::RuntimeError err;
+        auto recvHp = rt.getMember(*listenerObj, "receivedHp", err);
+        auto recvStatus = rt.getMember(*listenerObj, "lastStatus", err);
+        RS_CHECK(recvHp.has_value() && std::get<std::int64_t>(*recvHp) == 45);
+        RS_CHECK(recvStatus.has_value() && std::get<std::string>(*recvStatus) == "hit");
+
+        // 2) C++ scene.emitSignal notifies C++ subscriber
+        const std::size_t dispatched = scene.emitSignal(
+            emitterEnt, "HealthChanged",
+            {runtime::Value{std::int64_t{15}}, runtime::Value{std::string{"heal"}}});
+        RS_CHECK(dispatched == 1u);
+        recvHp = rt.getMember(*listenerObj, "receivedHp", err);
+        RS_CHECK(recvHp.has_value() && std::get<std::int64_t>(*recvHp) == 60);
+
+        // 3) C++ scene.emitSignal falls back seamlessly when only a script-side += handler is bound on [Signal]
+        const auto subEnt = scene.spawnGenerationalEntity("ScriptOnlySub");
+        RS_CHECK(scene.attachComponent(subEnt, "Game.Wave2ASignals::CombatEmitter"));
+        auto* subObj = scene.getComponent(subEnt, "Game.Wave2ASignals::CombatEmitter");
+        RS_CHECK(subObj != nullptr);
+        RS_CHECK(callMethod(*subObj, "BindScriptListener").succeeded);
+        const std::size_t scriptOnlyCount = scene.emitSignal(
+            subEnt, "HealthChanged",
+            {runtime::Value{std::int64_t{33}}, runtime::Value{std::string{"script"}}});
+        RS_CHECK(scriptOnlyCount == 1u);
+        const auto scriptSeen = rt.getMember(*subObj, "scriptSignalSeenHp", err);
+        RS_CHECK(scriptSeen.has_value() && std::get<std::int64_t>(*scriptSeen) == 33);
+
+        // 4) [RelayCommand] CanExecute gating + Execute
+        const auto atkCmdVal = rt.getMember(*emitterObj, "AttackCommand", err);
+        RS_CHECK(atkCmdVal.has_value() && std::holds_alternative<runtime::ObjectRef>(*atkCmdVal));
+        const auto can0 = callMethod(*emitterObj, "CheckAttackCommand", {runtime::Value{std::int64_t{20}}});
+        RS_CHECK(can0.succeeded && !std::get<bool>(can0.value));
+        RS_CHECK(callMethod(*emitterObj, "ExecAttackCommand", {runtime::Value{std::int64_t{20}}}).succeeded);
+        auto dmg = rt.getMember(*emitterObj, "attackDamage", err);
+        RS_CHECK(dmg.has_value() && std::get<std::int64_t>(*dmg) == 0);
+
+        RS_CHECK(rt.setMember(*emitterObj, "attackReady", runtime::Value{true}, err));
+        const auto can1 = callMethod(*emitterObj, "CheckAttackCommand", {runtime::Value{std::int64_t{20}}});
+        RS_CHECK(can1.succeeded && std::get<bool>(can1.value));
+        RS_CHECK(callMethod(*emitterObj, "ExecAttackCommand", {runtime::Value{std::int64_t{20}}}).succeeded);
+        dmg = rt.getMember(*emitterObj, "attackDamage", err);
+        RS_CHECK(dmg.has_value() && std::get<std::int64_t>(*dmg) == 20);
+        RS_CHECK(callMethod(*emitterObj, "ExecUiPingCommand").succeeded);
+        auto pingCnt = rt.getMember(*emitterObj, "uiPingCount", err);
+        RS_CHECK(pingCnt.has_value() && std::get<std::int64_t>(*pingCnt) == 1);
+    }
+
+    // 2. ModuleBuildCache persistence across separate GameScriptCompiler instances (-O2)
+    {
+        const std::string pureSrc = R"(module Game.Wave2ACache;
+
+public class CacheMathOps {
+    public static int FoldMath(int x) {
+        int a = 3 + 4;
+        return x + a;
+    }
+}
+)";
+        game::GameCompileOptions cacheOpts;
+        cacheOpts.optimizationLevel = game::GameOptimizationLevel::O2;
+        cacheOpts.enableStandardReactiveMacros = false;
+        cacheOpts.preferBuildCache = true;
+        cacheOpts.buildCacheDirectory = cacheDir;
+
+        game::GameScriptCompiler cA(api);
+        const auto first = cA.compile({{"CacheMath.rscript", pureSrc}}, cacheOpts);
+        RS_CHECK(first.succeeded());
+
+        game::GameScriptCompiler cB(api);
+        const auto second = cB.compile({{"CacheMath.rscript", pureSrc}}, cacheOpts);
+        RS_CHECK(second.succeeded());
+        RS_CHECK(second.usedBuildCache);
+
+        auto rt = game::ScriptRuntime::createIsolated(second.program);
+        const auto opsType = rt.findType("Game.Wave2ACache::CacheMathOps");
+        RS_CHECK(opsType.has_value());
+        const auto foldFn = rt.findMethod(*opsType, "FoldMath", 1);
+        RS_CHECK(foldFn.has_value());
+        const auto res = rt.invokeStatic(*foldFn, {runtime::Value{std::int64_t{10}}});
+        RS_CHECK(res.succeeded && std::get<std::int64_t>(res.value) == 17);
+    }
+
+    std::error_code ec;
+    fs::remove_all(tempRoot, ec);
+    std::cout << "[PASS] Wave 2A: GameScriptCompiler (-O2, Session, BuildCache, [Signal]/[RelayCommand], IDE export)\n";
+}
+
+void testWave2AStencilJitHotReloadAndDomainIsolation() {
+    game::GameApi api;
+    game::GameScriptCompiler compiler(api);
+
+    const std::string v1 = R"(module Game.Wave2AJit;
+public class State {
+    public int counter = 10;
+}
+public class JitOps {
+    public static int FastCompute(int x) {
+        return (x * 2) + 5;
+    }
+}
+)";
+    const std::string v2 = R"(module Game.Wave2AJit;
+public class State {
+    public int counter = 10;
+    public int extra = 88;
+}
+public class JitOps {
+    public static int FastCompute(int x) {
+        return (x * 3) + 100;
+    }
+}
+)";
+    const auto c1 = compiler.compile({{"jit_v1.rscript", v1}});
+    RS_CHECK(c1.succeeded());
+    const auto c2 = compiler.compile({{"jit_v2.rscript", v2}});
+    RS_CHECK(c2.succeeded());
+
+    auto rt1 = game::ScriptRuntime::createIsolated(c1.program);
+    auto rt2 = game::ScriptRuntime::createIsolated(c1.program);
+    RS_CHECK(rt1.valuePoolDomain() != nullptr && rt2.valuePoolDomain() != nullptr);
+    RS_CHECK(rt1.valuePoolDomain()->domainId() != 0u && rt2.valuePoolDomain()->domainId() != 0u);
+    RS_CHECK(rt1.valuePoolDomain()->domainId() != rt2.valuePoolDomain()->domainId());
+
+    const auto invokeFastCompute = [](const game::ScriptRuntime& runtime, std::int64_t x) {
+        const auto opsType = runtime.findType("Game.Wave2AJit::JitOps");
+        RS_CHECK(opsType.has_value());
+        const auto fn = runtime.findMethod(*opsType, "FastCompute", 1);
+        RS_CHECK(fn.has_value());
+        return runtime.invokeStatic(*fn, {runtime::Value{x}});
+    };
+
+    RS_CHECK(rt1.enableStencilJit(true));
+    RS_CHECK(rt1.stencilJitEnabled());
+    RS_CHECK(rt1.activeBackend() == game::ScriptExecutionBackend::StencilJit);
+
+    const auto r1 = invokeFastCompute(rt1, 7);
+    RS_CHECK(r1.succeeded && std::get<std::int64_t>(r1.value) == 19);
+
+    // Graceful VM fallback when StencilJit is toggled off
+    RS_CHECK(rt1.enableStencilJit(false));
+    RS_CHECK(rt1.activeBackend() == game::ScriptExecutionBackend::Interpreter);
+    const auto rVm = invokeFastCompute(rt1, 7);
+    RS_CHECK(rVm.succeeded && std::get<std::int64_t>(rVm.value) == 19);
+
+    // Re-enable StencilJit, then hot-reload SceneScriptRuntime -> preserves & re-jits StencilModule
+    RS_CHECK(rt1.enableStencilJit(true));
+    game::SceneScriptRuntime scene(rt1);
+    const auto ent = scene.spawnGenerationalEntity("JitEntity");
+    RS_CHECK(scene.attachComponent(ent, "Game.Wave2AJit::State"));
+    const auto reload = scene.hotReload(c2.program);
+    RS_CHECK(reload.succeeded);
+    RS_CHECK(rt1.stencilJitEnabled());
+    RS_CHECK(rt1.activeBackend() == game::ScriptExecutionBackend::StencilJit);
+
+    const auto r2 = invokeFastCompute(rt1, 7);
+    RS_CHECK(r2.succeeded && std::get<std::int64_t>(r2.value) == 121);
+    const auto rOther = invokeFastCompute(rt2, 7);
+    RS_CHECK(rOther.succeeded && std::get<std::int64_t>(rOther.value) == 19);
+
+    std::cout << "[PASS] Wave 2A: StencilJit tier, VM fallback, hot-reload re-jit & ValuePoolDomain isolation\n";
+}
+
+void testWave2ARsbsRollbackAndEcsParallelDispatch() {
+    game::GameApi api;
+    game::GameScriptCompiler compiler(api);
+    const std::string ecsSrc = R"(module Game.Wave2AEcs;
+
+public struct BodyPos {
+    public int x;
+    public int y;
+}
+
+public struct BodyVel {
+    public int dx;
+    public int dy;
+}
+
+public class PlayerState {
+    public int hp = 100;
+    public string tag = "ready";
+    public BodyPos pos;
+}
+
+public void StepBodies(int index, BodyPos[] positions, BodyVel[] velocities) {
+    BodyPos p = positions[index];
+    BodyVel v = velocities[index];
+    p.x = p.x + v.dx;
+    p.y = p.y + v.dy;
+    positions[index] = p;
+}
+)";
+    const auto compiled = compiler.compile({{"wave2a_ecs.rscript", ecsSrc}});
+    RS_CHECK(compiled.succeeded());
+
+    // 1. RSBS binary captureRollbackFrame / restoreRollbackFrame + eff_3 serializeSceneText preservation
+    {
+        auto rt = game::ScriptRuntime::createIsolated(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+        game::GameplayHost host(60);
+        (void)host.core().clock().step();
+
+        const auto pEnt = scene.spawnGenerationalEntity("PlayerOne");
+        RS_CHECK(scene.attachComponent(pEnt, "Game.Wave2AEcs::PlayerState"));
+        auto* comp = scene.getComponent(pEnt, "Game.Wave2AEcs::PlayerState");
+        RS_CHECK(comp != nullptr);
+        runtime::RuntimeError err;
+        RS_CHECK(rt.setMember(*comp, "hp", runtime::Value{std::int64_t{250}}, err));
+        RS_CHECK(rt.setMember(*comp, "tag", runtime::Value{std::string{"dash"}}, err));
+        scene.setLocalTransform(pEnt, game::Transform3D{
+            game::Vec3{game::Fixed::fromInt(11), game::Fixed::fromInt(22), game::Fixed::fromInt(0)},
+            game::Quat::identity(),
+            game::Vec3::fromInts(1, 1, 1)});
+
+        // Capture primary RSBS binary rollback frame
+        const auto snap = game::captureRollbackFrame(scene, host, err);
+        RS_CHECK(snap.has_value() && err.code == runtime::ErrorCode::None);
+        RS_CHECK(!snap->sceneBinary.empty());
+        RS_CHECK(snap->sceneJson.empty());
+        RS_CHECK(snap->sceneBinary[0] == 'R' && snap->sceneBinary[1] == 'S' &&
+                 snap->sceneBinary[2] == 'B' && snap->sceneBinary[3] == 'S');
+
+        // Verify eff_3 serializeSceneText remains intact alongside RSBS
+        const std::string eff3Text = game::serializeSceneText(scene, err);
+        RS_CHECK(err.code == runtime::ErrorCode::None && !eff3Text.empty());
+
+        // Advance and mutate state, then restore RSBS frame
+        RS_CHECK(rt.setMember(*comp, "hp", runtime::Value{std::int64_t{1}}, err));
+        RS_CHECK(rt.setMember(*comp, "tag", runtime::Value{std::string{"down"}}, err));
+        (void)host.core().clock().step();
+        (void)host.core().clock().step();
+        RS_CHECK(host.core().clock().tick() > snap->tick);
+
+        RS_CHECK(game::restoreRollbackFrame(scene, host, *snap, err));
+        RS_CHECK(host.core().clock().tick() == snap->tick);
+        auto* restored = scene.getComponent(pEnt, "Game.Wave2AEcs::PlayerState");
+        RS_CHECK(restored != nullptr);
+        const auto rHp = rt.getMember(*restored, "hp", err);
+        const auto rTag = rt.getMember(*restored, "tag", err);
+        RS_CHECK(rHp.has_value() && std::get<std::int64_t>(*rHp) == 250);
+        RS_CHECK(rTag.has_value() && std::get<std::string>(*rTag) == "dash");
+        RS_CHECK(scene.getLocalTransform(pEnt).position.x.toIntFloor() == 11);
+
+        // Corrupt RSBS payload fails cleanly
+        auto badSnap = *snap;
+        badSnap.sceneBinary[badSnap.sceneBinary.size() - 9u] ^= 0x11u;
+        RS_CHECK(!game::restoreRollbackFrame(scene, host, badSnap, err));
+    }
+
+    // 2. ECS Parallel Dispatch with raw columns + static verification + native batch kernel
+    {
+        auto rt = game::ScriptRuntime::createIsolated(compiled.program);
+        game::SceneScriptRuntime scene(rt);
+
+        constexpr std::size_t kCount = 96;
+        std::vector<HostBodyPos> positions(kCount);
+        std::vector<HostBodyVel> velocities(kCount);
+        for (std::size_t i = 0; i < kCount; ++i) {
+            positions[i] = {static_cast<std::int64_t>(i * 10), static_cast<std::int64_t>(i * 2)};
+            velocities[i] = {3, -1};
+        }
+
+        runtime::RuntimeError bindErr;
+        RS_CHECK(rt.bindEcsRawColumnStandardLayout(
+            "Game.Wave2AEcs::BodyPos", positions.data(), positions.size(), sizeof(HostBodyPos), bindErr));
+        RS_CHECK(rt.bindEcsRawColumnStandardLayout(
+            "Game.Wave2AEcs::BodyVel", velocities.data(), velocities.size(), sizeof(HostBodyVel), bindErr, true));
+
+        game::GameEcsParallelOptions denyOpts;
+        denyOpts.allowRawColumnArrays = false;
+        const auto denyVerify = game::ScriptRuntime::verifyEcsParallelFunction(
+            *compiled.program.program(), "Game.Wave2AEcs::StepBodies", denyOpts);
+        RS_CHECK(!denyVerify.valid);
+
+        game::GameEcsParallelOptions allowOpts;
+        allowOpts.workerCount = 4;
+        allowOpts.batchSize = 24;
+        allowOpts.allowRawColumnArrays = true;
+        allowOpts.allowReadOnlyStaticColumnLoads = true;
+        const auto allowVerify = game::ScriptRuntime::verifyEcsParallelFunction(
+            *compiled.program.program(), "Game.Wave2AEcs::StepBodies", allowOpts);
+        RS_CHECK(allowVerify.valid);
+
+        const auto res = scene.dispatchEcsParallel(
+            "Game.Wave2AEcs::StepBodies",
+            kCount,
+            {"Game.Wave2AEcs::BodyPos", "Game.Wave2AEcs::BodyVel"},
+            {},
+            allowOpts);
+        RS_CHECK(res.succeeded && res.totalItemsProcessed == kCount);
+        for (std::size_t i = 0; i < kCount; ++i) {
+            RS_CHECK(positions[i].x == static_cast<std::int64_t>(i * 10) + 3);
+            RS_CHECK(positions[i].y == static_cast<std::int64_t>(i * 2) - 1);
+        }
+    }
+
+    std::cout << "[PASS] Wave 2A: RSBS binary rollback snapshot, eff_3 preservation & ECS parallel dispatch\n";
+}
+
 } // namespace
 
 int main() {
@@ -581,6 +1030,9 @@ int main() {
     testSceneLifecycleEventsTriggersAndAsyncCancellation();
     testHotReloadGuidsSerializationAndRemoteDebug();
     testSceneHotReloadFieldTagsAndGameplayCodecMigration();
+    testWave2ACompilerOptMacrosCacheIdeExportAndSignals();
+    testWave2AStencilJitHotReloadAndDomainIsolation();
+    testWave2ARsbsRollbackAndEcsParallelDispatch();
     std::cout << "All app_game_sdk_and_scene_tests passed!\n";
     return 0;
 }

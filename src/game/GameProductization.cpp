@@ -134,6 +134,7 @@ public:
         writeU32(static_cast<std::uint32_t>(value.size()));
         bytes_.insert(bytes_.end(), value.begin(), value.end());
     }
+    [[nodiscard]] const std::vector<std::uint8_t>& buffer() const noexcept { return bytes_; }
     std::vector<std::uint8_t> take() { return std::move(bytes_); }
 
 private:
@@ -142,10 +143,13 @@ private:
 
 class Reader {
 public:
-    explicit Reader(const std::vector<std::uint8_t>& bytes) : bytes_(bytes) {}
+    explicit Reader(const std::vector<std::uint8_t>& bytes)
+        : bytes_(bytes), limit_(bytes.size()) {}
+    Reader(const std::vector<std::uint8_t>& bytes, std::size_t limit)
+        : bytes_(bytes), limit_(std::min(limit, bytes.size())) {}
 
     bool readU8(std::uint8_t& value) {
-        if (offset_ >= bytes_.size()) return false;
+        if (offset_ >= limit_) return false;
         value = bytes_[offset_++];
         return true;
     }
@@ -169,18 +173,52 @@ public:
     }
     bool readString(std::string& value) {
         std::uint32_t size = 0;
-        if (!readU32(size) || size > bytes_.size() - offset_) return false;
+        if (!readU32(size) || size > limit_ - offset_) return false;
         value.assign(
             reinterpret_cast<const char*>(bytes_.data() + offset_), size);
         offset_ += size;
         return true;
     }
-    bool atEnd() const noexcept { return offset_ == bytes_.size(); }
+    void setOffset(std::size_t pos) noexcept {
+        offset_ = pos <= limit_ ? pos : limit_;
+    }
+    [[nodiscard]] std::size_t offset() const noexcept { return offset_; }
+    bool atEnd() const noexcept { return offset_ == limit_; }
 
 private:
     const std::vector<std::uint8_t>& bytes_;
+    std::size_t limit_ = 0;
     std::size_t offset_ = 0;
 };
+
+const semantic::FieldSymbol* findSignalDelegateFieldInType(
+    const ScriptType& type,
+    const std::string& signalName) {
+    if (signalName.empty()) return nullptr;
+    const auto findByBase = [&](const std::string& baseName) -> const semantic::FieldSymbol* {
+        const std::string backingFieldName = "$event_" + baseName + "_delegate";
+        for (const auto& f : type.descriptor.fields) {
+            if (f.name == backingFieldName && f.type == semantic::PrimitiveType::Object) {
+                return &f;
+            }
+        }
+        return nullptr;
+    };
+    if (const auto* direct = findByBase(signalName)) {
+        return direct;
+    }
+    constexpr std::string_view kEventSuffix = "Event";
+    if (signalName.size() <= kEventSuffix.size() ||
+        signalName.compare(
+            signalName.size() - kEventSuffix.size(),
+            kEventSuffix.size(),
+            kEventSuffix) != 0) {
+        if (const auto* suffixed = findByBase(signalName + "Event")) {
+            return suffixed;
+        }
+    }
+    return nullptr;
+}
 
 std::uint64_t canonicalDoubleBits(double value) noexcept {
     if (value != value) return 0x7ff8000000000000ULL;
@@ -1992,14 +2030,8 @@ bool importSceneJson(
                         "signal connection references missing entity or component");
                     return false;
                 }
-                const std::string backingFieldName = "$event_" + sigName->stringValue() + "_delegate";
-                const semantic::FieldSymbol* eventField = nullptr;
-                for (const auto& f : srcType->descriptor.fields) {
-                    if (f.name == backingFieldName && f.type == semantic::PrimitiveType::Object) {
-                        eventField = &f;
-                        break;
-                    }
-                }
+                const semantic::FieldSymbol* eventField =
+                    findSignalDelegateFieldInType(*srcType, sigName->stringValue());
                 if (!eventField) {
                     fail(error, runtime::ErrorCode::InvalidProgram,
                         "signal '" + sigName->stringValue() + "' not found on source component");
@@ -2377,6 +2409,1639 @@ bool importSceneJson(
     return true;
 }
 
+namespace {
+
+enum class RsbsValTag : std::uint8_t {
+    Monostate = 0,
+    NullString = 1,
+    NullObject = 2,
+    NullArray = 3,
+    Bool = 4,
+    Byte = 5,
+    SByte = 6,
+    Short = 7,
+    UShort = 8,
+    Int64 = 9,
+    UInt = 10,
+    Long = 11,
+    ULong = 12,
+    Float = 13,
+    Double = 14,
+    Char = 15,
+    Enum = 16,
+    Fixed = 17,
+    Fixed16 = 18,
+    Fixed64 = 19,
+    Vec2 = 20,
+    Vec3 = 21,
+    Quat = 22,
+    Vec2f = 23,
+    Vec3f = 24,
+    Quatf = 25,
+    String = 26,
+    ComponentRef = 27,
+    Array = 28,
+    Object = 29,
+    Struct = 30,
+};
+
+template <typename To, typename From>
+To bitCastValue(const From& src) noexcept {
+    static_assert(sizeof(To) == sizeof(From));
+    To dst{};
+    std::memcpy(&dst, &src, sizeof(To));
+    return dst;
+}
+
+bool encodeValueBinary(
+    const ScriptRuntime& runtime,
+    const SceneScriptRuntime* scene,
+    const runtime::Value& value,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    Writer& writer,
+    runtime::RuntimeError& error) {
+    if (depth > policy.maximumStructDepth) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "scene binary exceeded maximum struct/object recursion depth");
+        return false;
+    }
+    if (std::holds_alternative<std::monostate>(value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Monostate));
+        return true;
+    }
+    if (std::holds_alternative<runtime::NullString>(value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::NullString));
+        return true;
+    }
+    if (std::holds_alternative<runtime::NullObject>(value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::NullObject));
+        return true;
+    }
+    if (std::holds_alternative<runtime::NullArray>(value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::NullArray));
+        return true;
+    }
+    if (const auto* b = std::get_if<bool>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Bool));
+        writer.writeU8(*b ? 1u : 0u);
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::ByteValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Byte));
+        writer.writeU8(v->value);
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::SByteValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::SByte));
+        writer.writeU8(static_cast<std::uint8_t>(v->value));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::ShortValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Short));
+        writer.writeU32(static_cast<std::uint32_t>(static_cast<std::int32_t>(v->value)));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::UShortValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::UShort));
+        writer.writeU32(static_cast<std::uint32_t>(v->value));
+        return true;
+    }
+    if (const auto* v = std::get_if<std::int64_t>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Int64));
+        writer.writeU64(static_cast<std::uint64_t>(*v));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::UIntValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::UInt));
+        writer.writeU32(v->value);
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::LongValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Long));
+        writer.writeU64(static_cast<std::uint64_t>(v->value));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::ULongValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::ULong));
+        writer.writeU64(v->value);
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::FloatValue>(&value)) {
+        if (!policy.allowDoubles || !std::isfinite(v->value)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "floating-point value disallowed or non-finite in RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Float));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->value));
+        return true;
+    }
+    if (const auto* v = std::get_if<double>(&value)) {
+        if (!policy.allowDoubles || !std::isfinite(*v)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "floating-point value disallowed or non-finite in RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Double));
+        writer.writeU64(canonicalDoubleBits(*v));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::CharValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Char));
+        writer.writeU32(static_cast<std::uint32_t>(v->value));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::EnumValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Enum));
+        writer.writeU64(static_cast<std::uint64_t>(v->typeId));
+        std::string enumTypeName;
+        if (const auto* ed = findProgramTypeById(runtime.program().get(), v->typeId)) {
+            enumTypeName = semantic::canonicalTypeName(*ed);
+        }
+        writer.writeString(enumTypeName);
+        writer.writeU64(static_cast<std::uint64_t>(v->value));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::FixedValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Fixed));
+        writer.writeU32(static_cast<std::uint32_t>(v->raw));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Fixed16Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Fixed16));
+        writer.writeU64(static_cast<std::uint64_t>(v->raw));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Fixed64Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Fixed64));
+        writer.writeU64(static_cast<std::uint64_t>(v->raw));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Vec2Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Vec2));
+        writer.writeU32(static_cast<std::uint32_t>(v->x));
+        writer.writeU32(static_cast<std::uint32_t>(v->y));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Vec3Value>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Vec3));
+        writer.writeU32(static_cast<std::uint32_t>(v->x));
+        writer.writeU32(static_cast<std::uint32_t>(v->y));
+        writer.writeU32(static_cast<std::uint32_t>(v->z));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::QuatValue>(&value)) {
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Quat));
+        writer.writeU32(static_cast<std::uint32_t>(v->x));
+        writer.writeU32(static_cast<std::uint32_t>(v->y));
+        writer.writeU32(static_cast<std::uint32_t>(v->z));
+        writer.writeU32(static_cast<std::uint32_t>(v->w));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Vec2fValue>(&value)) {
+        if (!policy.allowDoubles || !std::isfinite(v->x) || !std::isfinite(v->y)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "Vec2f value disallowed or non-finite in RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Vec2f));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->x));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->y));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::Vec3fValue>(&value)) {
+        if (!policy.allowDoubles ||
+            !std::isfinite(v->x) || !std::isfinite(v->y) || !std::isfinite(v->z)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "Vec3f value disallowed or non-finite in RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Vec3f));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->x));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->y));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->z));
+        return true;
+    }
+    if (const auto* v = std::get_if<runtime::QuatfValue>(&value)) {
+        if (!policy.allowDoubles ||
+            !std::isfinite(v->x) || !std::isfinite(v->y) ||
+            !std::isfinite(v->z) || !std::isfinite(v->w)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "Quatf value disallowed or non-finite in RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Quatf));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->x));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->y));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->z));
+        writer.writeU32(bitCastValue<std::uint32_t>(v->w));
+        return true;
+    }
+    if (const auto* s = std::get_if<std::string>(&value)) {
+        if (!policy.allowStrings) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "string value disallowed by ScriptStatePolicy in RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::String));
+        writer.writeString(*s);
+        return true;
+    }
+    if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
+        if (!objRef->valid()) {
+            writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::NullObject));
+            return true;
+        }
+        if (scene) {
+            if (const auto loc = scene->findObjectLocation(*objRef)) {
+                writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::ComponentRef));
+                writer.writeU64(static_cast<std::uint64_t>(loc->entity));
+                writer.writeString(loc->canonicalTypeName);
+                return true;
+            }
+        }
+        if (runtime.heap()) {
+            if (const auto len = runtime.heap()->arrayLength(*objRef)) {
+                writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Array));
+                std::string arrTypeName;
+                if (const auto arrTid = runtime.heap()->objectTypeId(*objRef)) {
+                    if (const auto* arrDesc = findProgramTypeById(runtime.program().get(), *arrTid)) {
+                        arrTypeName = semantic::canonicalTypeName(*arrDesc);
+                    }
+                }
+                const auto elemPrim = runtime.heap()->arrayElementType(*objRef)
+                    .value_or(semantic::PrimitiveType::Int);
+                std::string elemTypeName;
+                if (const auto elemTid = runtime.heap()->arrayElementTypeId(*objRef)) {
+                    if (const auto* elemDesc = findProgramTypeById(runtime.program().get(), *elemTid)) {
+                        elemTypeName = semantic::canonicalTypeName(*elemDesc);
+                    }
+                }
+                writer.writeString(arrTypeName);
+                writer.writeU8(static_cast<std::uint8_t>(elemPrim));
+                writer.writeString(elemTypeName);
+                writer.writeU32(static_cast<std::uint32_t>(*len));
+                for (std::size_t idx = 0; idx < *len; ++idx) {
+                    const auto elemVal = runtime.heap()->arrayGet(*objRef, idx);
+                    if (!elemVal) {
+                        fail(error, runtime::ErrorCode::InvalidObjectReference,
+                            "failed to read array element during RSBS encode");
+                        return false;
+                    }
+                    if (!encodeValueBinary(runtime, scene, *elemVal, policy, depth + 1u, writer, error)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (const auto objTid = runtime.heap()->objectTypeId(*objRef)) {
+                const auto* objDesc = findProgramTypeById(runtime.program().get(), *objTid);
+                if (!objDesc) {
+                    fail(error, runtime::ErrorCode::InvalidObjectReference,
+                        "unknown object type id during RSBS encode");
+                    return false;
+                }
+                std::vector<std::pair<std::string, runtime::Value>> serialFields;
+                for (std::size_t idx = 0; idx < objDesc->fields.size(); ++idx) {
+                    const auto& f = objDesc->fields[idx];
+                    const bool isSeq = f.synthetic && f.name.rfind("$sequence_", 0) == 0;
+                    if (!isSeq &&
+                        (f.synthetic || f.staticField || f.constField ||
+                         (!f.name.empty() && f.name.front() == '$'))) {
+                        continue;
+                    }
+                    if (f.name == "__native" && f.type == semantic::PrimitiveType::Handle) {
+                        continue;
+                    }
+                    const auto fv = runtime.heap()->fieldGet(*objRef, idx);
+                    if (!fv) {
+                        fail(error, runtime::ErrorCode::InvalidObjectReference,
+                            "failed to read object field during RSBS encode");
+                        return false;
+                    }
+                    serialFields.push_back({f.name, *fv});
+                }
+                if (serialFields.size() > policy.maximumFields) {
+                    fail(error, runtime::ErrorCode::DeterminismViolation,
+                        "script object exceeded maximumFields during RSBS encode");
+                    return false;
+                }
+                writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Object));
+                writer.writeString(semantic::canonicalTypeName(*objDesc));
+                writer.writeU32(static_cast<std::uint32_t>(serialFields.size()));
+                for (const auto& [fname, fval] : serialFields) {
+                    writer.writeString(fname);
+                    if (!encodeValueBinary(runtime, scene, fval, policy, depth + 1u, writer, error)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        fail(error, runtime::ErrorCode::InvalidObjectReference,
+            "cannot serialize unresolved ObjectRef in RSBS encode");
+        return false;
+    }
+    if (const auto* sVal = std::get_if<runtime::StructValue>(&value)) {
+        const auto sTid = runtime::structValueTypeId(value).value_or(sVal->typeId);
+        std::string sTypeName;
+        if (const auto* sDesc = findProgramTypeById(runtime.program().get(), sTid)) {
+            sTypeName = semantic::canonicalTypeName(*sDesc);
+        }
+        const std::size_t fCount = sVal->fieldCount();
+        if (fCount > policy.maximumFields) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "struct exceeded maximumFields during RSBS encode");
+            return false;
+        }
+        writer.writeU8(static_cast<std::uint8_t>(RsbsValTag::Struct));
+        writer.writeU64(static_cast<std::uint64_t>(sTid));
+        writer.writeString(sTypeName);
+        writer.writeU32(static_cast<std::uint32_t>(fCount));
+        for (std::size_t idx = 0; idx < fCount; ++idx) {
+            const auto elem = runtime::structValueFieldAt(*sVal, idx);
+            if (!elem) {
+                fail(error, runtime::ErrorCode::InvalidObjectReference,
+                    "failed to read struct field during RSBS encode");
+                return false;
+            }
+            if (!encodeValueBinary(runtime, scene, *elem, policy, depth + 1u, writer, error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    fail(error, runtime::ErrorCode::DeterminismViolation,
+        "unsupported value tag during RSBS encode");
+    return false;
+}
+
+bool decodeValueBinary(
+    ScriptRuntime& runtime,
+    SceneScriptRuntime* scene,
+    Reader& reader,
+    const ScriptStatePolicy& policy,
+    std::size_t depth,
+    std::vector<runtime::PersistentRoot>& tempRoots,
+    runtime::Value& out,
+    runtime::RuntimeError& error) {
+    if (depth > policy.maximumStructDepth) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "RSBS payload exceeded maximum recursion depth");
+        return false;
+    }
+    std::uint8_t tagByte = 0;
+    if (!reader.readU8(tagByte)) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "unexpected EOF reading value tag from RSBS payload");
+        return false;
+    }
+    const auto tag = static_cast<RsbsValTag>(tagByte);
+    switch (tag) {
+    case RsbsValTag::Monostate:
+        out = runtime::Value{};
+        return true;
+    case RsbsValTag::NullString:
+        out = runtime::Value{runtime::NullString{}};
+        return true;
+    case RsbsValTag::NullObject:
+        out = runtime::Value{runtime::NullObject{}};
+        return true;
+    case RsbsValTag::NullArray:
+        out = runtime::Value{runtime::NullArray{}};
+        return true;
+    case RsbsValTag::Bool: {
+        std::uint8_t b = 0;
+        if (!reader.readU8(b)) return false;
+        out = runtime::Value{b != 0};
+        return true;
+    }
+    case RsbsValTag::Byte: {
+        std::uint8_t v = 0;
+        if (!reader.readU8(v)) return false;
+        out = runtime::Value{runtime::ByteValue{v}};
+        return true;
+    }
+    case RsbsValTag::SByte: {
+        std::uint8_t v = 0;
+        if (!reader.readU8(v)) return false;
+        out = runtime::Value{runtime::SByteValue{static_cast<std::int8_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::Short: {
+        std::uint32_t v = 0;
+        if (!reader.readU32(v)) return false;
+        out = runtime::Value{runtime::ShortValue{static_cast<std::int16_t>(static_cast<std::int32_t>(v))}};
+        return true;
+    }
+    case RsbsValTag::UShort: {
+        std::uint32_t v = 0;
+        if (!reader.readU32(v)) return false;
+        out = runtime::Value{runtime::UShortValue{static_cast<std::uint16_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::Int64: {
+        std::uint64_t v = 0;
+        if (!reader.readU64(v)) return false;
+        out = runtime::Value{static_cast<std::int64_t>(v)};
+        return true;
+    }
+    case RsbsValTag::UInt: {
+        std::uint32_t v = 0;
+        if (!reader.readU32(v)) return false;
+        out = runtime::Value{runtime::UIntValue{v}};
+        return true;
+    }
+    case RsbsValTag::Long: {
+        std::uint64_t v = 0;
+        if (!reader.readU64(v)) return false;
+        out = runtime::Value{runtime::LongValue{static_cast<std::int64_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::ULong: {
+        std::uint64_t v = 0;
+        if (!reader.readU64(v)) return false;
+        out = runtime::Value{runtime::ULongValue{v}};
+        return true;
+    }
+    case RsbsValTag::Float: {
+        if (!policy.allowDoubles) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "float value disallowed by ScriptStatePolicy in RSBS payload");
+            return false;
+        }
+        std::uint32_t bits = 0;
+        if (!reader.readU32(bits)) return false;
+        const float f = bitCastValue<float>(bits);
+        if (!std::isfinite(f)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "non-finite float in RSBS payload");
+            return false;
+        }
+        out = runtime::Value{runtime::FloatValue{f}};
+        return true;
+    }
+    case RsbsValTag::Double: {
+        if (!policy.allowDoubles) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "double value disallowed by ScriptStatePolicy in RSBS payload");
+            return false;
+        }
+        std::uint64_t bits = 0;
+        if (!reader.readU64(bits)) return false;
+        const double d = bitCastValue<double>(bits);
+        if (!std::isfinite(d)) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "non-finite double in RSBS payload");
+            return false;
+        }
+        out = runtime::Value{d};
+        return true;
+    }
+    case RsbsValTag::Char: {
+        std::uint32_t v = 0;
+        if (!reader.readU32(v)) return false;
+        out = runtime::Value{runtime::CharValue{static_cast<char16_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::Enum: {
+        std::uint64_t rawTid = 0;
+        std::string typeName;
+        std::uint64_t rawVal = 0;
+        if (!reader.readU64(rawTid) || !reader.readString(typeName) || !reader.readU64(rawVal)) {
+            return false;
+        }
+        semantic::SymbolId tid = static_cast<semantic::SymbolId>(rawTid);
+        if (!typeName.empty()) {
+            if (const auto st = runtime.findType(typeName)) {
+                tid = st->descriptor.id;
+            }
+        }
+        out = runtime::Value{runtime::EnumValue{tid, static_cast<std::int64_t>(rawVal)}};
+        return true;
+    }
+    case RsbsValTag::Fixed: {
+        std::uint32_t v = 0;
+        if (!reader.readU32(v)) return false;
+        out = runtime::Value{runtime::FixedValue{static_cast<std::int32_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::Fixed16: {
+        std::uint64_t v = 0;
+        if (!reader.readU64(v)) return false;
+        out = runtime::Value{runtime::Fixed16Value{static_cast<std::int64_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::Fixed64: {
+        std::uint64_t v = 0;
+        if (!reader.readU64(v)) return false;
+        out = runtime::Value{runtime::Fixed64Value{static_cast<std::int64_t>(v)}};
+        return true;
+    }
+    case RsbsValTag::Vec2: {
+        std::uint32_t x = 0, y = 0;
+        if (!reader.readU32(x) || !reader.readU32(y)) return false;
+        out = runtime::Value{runtime::Vec2Value{
+            static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)}};
+        return true;
+    }
+    case RsbsValTag::Vec3: {
+        std::uint32_t x = 0, y = 0, z = 0;
+        if (!reader.readU32(x) || !reader.readU32(y) || !reader.readU32(z)) return false;
+        out = runtime::Value{runtime::Vec3Value{
+            static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), static_cast<std::int32_t>(z)}};
+        return true;
+    }
+    case RsbsValTag::Quat: {
+        std::uint32_t x = 0, y = 0, z = 0, w = 0;
+        if (!reader.readU32(x) || !reader.readU32(y) || !reader.readU32(z) || !reader.readU32(w)) return false;
+        out = runtime::Value{runtime::QuatValue{
+            static_cast<std::int32_t>(x), static_cast<std::int32_t>(y),
+            static_cast<std::int32_t>(z), static_cast<std::int32_t>(w)}};
+        return true;
+    }
+    case RsbsValTag::Vec2f: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t x = 0, y = 0;
+        if (!reader.readU32(x) || !reader.readU32(y)) return false;
+        const float fx = bitCastValue<float>(x);
+        const float fy = bitCastValue<float>(y);
+        if (!std::isfinite(fx) || !std::isfinite(fy)) return false;
+        out = runtime::Value{runtime::Vec2fValue{fx, fy}};
+        return true;
+    }
+    case RsbsValTag::Vec3f: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t x = 0, y = 0, z = 0;
+        if (!reader.readU32(x) || !reader.readU32(y) || !reader.readU32(z)) return false;
+        const float fx = bitCastValue<float>(x);
+        const float fy = bitCastValue<float>(y);
+        const float fz = bitCastValue<float>(z);
+        if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(fz)) return false;
+        out = runtime::Value{runtime::Vec3fValue{fx, fy, fz}};
+        return true;
+    }
+    case RsbsValTag::Quatf: {
+        if (!policy.allowDoubles) return false;
+        std::uint32_t x = 0, y = 0, z = 0, w = 0;
+        if (!reader.readU32(x) || !reader.readU32(y) || !reader.readU32(z) || !reader.readU32(w)) return false;
+        const float fx = bitCastValue<float>(x);
+        const float fy = bitCastValue<float>(y);
+        const float fz = bitCastValue<float>(z);
+        const float fw = bitCastValue<float>(w);
+        if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(fz) || !std::isfinite(fw)) {
+            return false;
+        }
+        out = runtime::Value{runtime::QuatfValue{fx, fy, fz, fw}};
+        return true;
+    }
+    case RsbsValTag::String: {
+        if (!policy.allowStrings) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "string value disallowed by ScriptStatePolicy in RSBS payload");
+            return false;
+        }
+        std::string s;
+        if (!reader.readString(s)) return false;
+        out = runtime::Value{s};
+        return true;
+    }
+    case RsbsValTag::ComponentRef: {
+        std::uint64_t entId = 0;
+        std::string compType;
+        if (!reader.readU64(entId) || !reader.readString(compType)) return false;
+        if (!scene) {
+            fail(error, runtime::ErrorCode::InvalidObjectReference,
+                "RSBS ComponentRef requires active SceneScriptRuntime");
+            return false;
+        }
+        auto* compObj = scene->getComponent(static_cast<SceneEntityId>(entId), compType);
+        if (!compObj || !compObj->valid()) {
+            fail(error, runtime::ErrorCode::InvalidObjectReference,
+                "RSBS ComponentRef targets missing entity/component");
+            return false;
+        }
+        out = runtime::Value{compObj->reference()};
+        return true;
+    }
+    case RsbsValTag::Array: {
+        std::string arrTypeName;
+        std::uint8_t primByte = 0;
+        std::string elemTypeName;
+        std::uint32_t len = 0;
+        if (!reader.readString(arrTypeName) || !reader.readU8(primByte) ||
+            !reader.readString(elemTypeName) || !reader.readU32(len)) {
+            return false;
+        }
+        if (!runtime.heap()) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "RSBS Array decode requires ManagedHeap");
+            return false;
+        }
+        const auto elemPrim = static_cast<semantic::PrimitiveType>(primByte);
+        semantic::SymbolId arrTid = 0;
+        if (!arrTypeName.empty()) {
+            if (const auto arrType = runtime.findType(arrTypeName)) {
+                arrTid = arrType->descriptor.id;
+            } else {
+                arrTid = semantic::stableTypeId(arrTypeName);
+            }
+        }
+        semantic::SymbolId elemTid = 0;
+        if (!elemTypeName.empty()) {
+            if (const auto elemType = runtime.findType(elemTypeName)) {
+                elemTid = elemType->descriptor.id;
+            } else {
+                elemTid = semantic::stableTypeId(elemTypeName);
+            }
+        }
+        const runtime::Value defVal =
+            makeDefaultTypedArrayElement(&runtime, elemPrim, elemTid, depth + 1u);
+        const auto arrRef = runtime.heap()->allocateTypedArray(
+            arrTid, elemPrim, elemTid, len, defVal, &error);
+        if (!arrRef) {
+            return false;
+        }
+        tempRoots.push_back(runtime.heap()->retain(*arrRef));
+        for (std::uint32_t idx = 0; idx < len; ++idx) {
+            runtime::Value elem;
+            if (!decodeValueBinary(runtime, scene, reader, policy, depth + 1u, tempRoots, elem, error)) {
+                return false;
+            }
+            if (!runtime.heap()->arraySet(*arrRef, idx, std::move(elem), &error)) {
+                return false;
+            }
+        }
+        out = runtime::Value{*arrRef};
+        return true;
+    }
+    case RsbsValTag::Object: {
+        std::string typeName;
+        std::uint32_t fieldCount = 0;
+        if (!reader.readString(typeName) || !reader.readU32(fieldCount)) return false;
+        if (fieldCount > policy.maximumFields) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "RSBS Object field count exceeds ScriptStatePolicy");
+            return false;
+        }
+        const auto objType = runtime.findType(typeName);
+        if (!objType || objType->descriptor.kind != semantic::TypeKind::Class) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "RSBS Object references unknown class '" + typeName + "'");
+            return false;
+        }
+        auto obj = runtime.createPrototypeObject(*objType, error);
+        if (!obj || !obj->valid() || !runtime.heap()) {
+            return false;
+        }
+        tempRoots.push_back(runtime.heap()->retain(obj->reference()));
+        for (std::uint32_t i = 0; i < fieldCount; ++i) {
+            std::string fname;
+            if (!reader.readString(fname)) return false;
+            runtime::Value fval;
+            if (!decodeValueBinary(runtime, scene, reader, policy, depth + 1u, tempRoots, fval, error)) {
+                return false;
+            }
+            bool matchedSeq = false;
+            if (fname.rfind("$sequence_", 0) == 0) {
+                for (const auto& fdesc : obj->type().descriptor.fields) {
+                    if (fdesc.name == fname) {
+                        if (!runtime.heap()->fieldSet(
+                                obj->reference(), fdesc.index, std::move(fval), &error)) {
+                            return false;
+                        }
+                        matchedSeq = true;
+                        break;
+                    }
+                }
+            }
+            if (!matchedSeq && !runtime.setMember(*obj, fname, fval, error)) {
+                return false;
+            }
+        }
+        out = runtime::Value{obj->reference()};
+        return true;
+    }
+    case RsbsValTag::Struct: {
+        std::uint64_t rawTid = 0;
+        std::string sTypeName;
+        std::uint32_t fieldCount = 0;
+        if (!reader.readU64(rawTid) || !reader.readString(sTypeName) || !reader.readU32(fieldCount)) {
+            return false;
+        }
+        if (fieldCount > policy.maximumFields) {
+            fail(error, runtime::ErrorCode::DeterminismViolation,
+                "RSBS Struct field count exceeds ScriptStatePolicy");
+            return false;
+        }
+        semantic::SymbolId tid = static_cast<semantic::SymbolId>(rawTid);
+        if (!sTypeName.empty()) {
+            if (const auto st = runtime.findType(sTypeName)) {
+                tid = st->descriptor.id;
+            }
+        }
+        std::vector<runtime::Value> fields;
+        fields.reserve(fieldCount);
+        for (std::uint32_t idx = 0; idx < fieldCount; ++idx) {
+            runtime::Value fv;
+            if (!decodeValueBinary(runtime, scene, reader, policy, depth + 1u, tempRoots, fv, error)) {
+                return false;
+            }
+            fields.push_back(std::move(fv));
+        }
+        if (auto inlineVal = runtime::makeDefaultInlineStructValue(tid)) {
+            bool ok = true;
+            for (std::size_t idx = 0; idx < fields.size(); ++idx) {
+                auto updated = runtime::storeInlineStructField(*inlineVal, idx, fields[idx]);
+                if (!updated) {
+                    ok = false;
+                    break;
+                }
+                inlineVal = updated;
+            }
+            if (ok) {
+                out = *inlineVal;
+                return true;
+            }
+        }
+        out = runtime::Value{runtime::makeStructValueFromFields(tid, std::move(fields))};
+        return true;
+    }
+    default:
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "unknown value tag in RSBS payload");
+        return false;
+    }
+}
+
+void writeVec3Binary(Writer& w, const Vec3& v) {
+    w.writeU32(static_cast<std::uint32_t>(v.x.raw));
+    w.writeU32(static_cast<std::uint32_t>(v.y.raw));
+    w.writeU32(static_cast<std::uint32_t>(v.z.raw));
+}
+
+bool readVec3Binary(Reader& r, Vec3& v) {
+    std::uint32_t x = 0, y = 0, z = 0;
+    if (!r.readU32(x) || !r.readU32(y) || !r.readU32(z)) return false;
+    v.x = Fixed::fromRaw(static_cast<std::int32_t>(x));
+    v.y = Fixed::fromRaw(static_cast<std::int32_t>(y));
+    v.z = Fixed::fromRaw(static_cast<std::int32_t>(z));
+    return true;
+}
+
+void writeQuatBinary(Writer& w, const Quat& q) {
+    w.writeU32(static_cast<std::uint32_t>(q.x.raw));
+    w.writeU32(static_cast<std::uint32_t>(q.y.raw));
+    w.writeU32(static_cast<std::uint32_t>(q.z.raw));
+    w.writeU32(static_cast<std::uint32_t>(q.w.raw));
+}
+
+bool readQuatBinary(Reader& r, Quat& q) {
+    std::uint32_t x = 0, y = 0, z = 0, w = 0;
+    if (!r.readU32(x) || !r.readU32(y) || !r.readU32(z) || !r.readU32(w)) return false;
+    q.x = Fixed::fromRaw(static_cast<std::int32_t>(x));
+    q.y = Fixed::fromRaw(static_cast<std::int32_t>(y));
+    q.z = Fixed::fromRaw(static_cast<std::int32_t>(z));
+    q.w = Fixed::fromRaw(static_cast<std::int32_t>(w));
+    return true;
+}
+
+} // namespace
+
+std::vector<std::uint8_t> encodeSceneBinary(
+    const SceneScriptRuntime& scene,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    error = {};
+    const auto& runtime = scene.runtime();
+    Writer writer;
+    writer.writeU32(kSceneBinaryMagic);
+    writer.writeU32(kSceneBinaryCodecVersion);
+
+    const auto& entities = scene.entities();
+    writer.writeU32(static_cast<std::uint32_t>(entities.size()));
+    for (const auto entityId : entities) {
+        writer.writeU64(static_cast<std::uint64_t>(entityId));
+        writer.writeU8(scene.isEntityActiveSelf(entityId) ? 1u : 0u);
+        writer.writeU64(static_cast<std::uint64_t>(scene.getParent(entityId)));
+
+        const Transform3D localTf = scene.getLocalTransform(entityId);
+        writeVec3Binary(writer, localTf.position);
+        writeQuatBinary(writer, localTf.rotation);
+        writeVec3Binary(writer, localTf.scale);
+
+        writer.writeString(scene.getEntityName(entityId));
+        const auto groups = scene.getEntityGroups(entityId);
+        writer.writeU32(static_cast<std::uint32_t>(groups.size()));
+        for (const auto& g : groups) {
+            writer.writeString(g);
+        }
+
+        if (const auto col = scene.getEntityCollider2D(entityId)) {
+            writer.writeU8(1u);
+            writer.writeU32(static_cast<std::uint32_t>(col->halfExtents.x.raw));
+            writer.writeU32(static_cast<std::uint32_t>(col->halfExtents.y.raw));
+            writer.writeU32(static_cast<std::uint32_t>(col->radius.raw));
+            writer.writeU8(col->isCircle ? 1u : 0u);
+            writer.writeU8(col->isTrigger ? 1u : 0u);
+            writer.writeU32(col->layerMask);
+            writer.writeU32(col->collisionLayer);
+            writer.writeU32(col->collisionMask);
+        } else {
+            writer.writeU8(0u);
+        }
+
+        if (const auto col3 = scene.getEntityCollider3D(entityId)) {
+            writer.writeU8(1u);
+            writeVec3Binary(writer, col3->halfExtents);
+            writer.writeU32(static_cast<std::uint32_t>(col3->radius.raw));
+            writer.writeU8(col3->isSphere ? 1u : 0u);
+            writer.writeU8(col3->isTrigger ? 1u : 0u);
+            writer.writeU32(col3->layerMask);
+            writer.writeU32(col3->collisionLayer);
+            writer.writeU32(col3->collisionMask);
+        } else {
+            writer.writeU8(0u);
+        }
+
+        std::vector<const ScriptObject*> validComps;
+        for (const auto* compObj : scene.getComponents(entityId)) {
+            if (compObj && compObj->valid()) validComps.push_back(compObj);
+        }
+        writer.writeU32(static_cast<std::uint32_t>(validComps.size()));
+        for (const auto* compObj : validComps) {
+            const auto& fields = compObj->type().descriptor.fields;
+            if (fields.size() > policy.maximumFields) {
+                fail(error, runtime::ErrorCode::DeterminismViolation,
+                    "script component exceeded maximumFields during RSBS encode");
+                return {};
+            }
+            const std::string canonType = compObj->type().canonicalName();
+            writer.writeString(canonType);
+            writer.writeU8(scene.isComponentEnabled(entityId, canonType) ? 1u : 0u);
+            writer.writeU8(scene.isComponentStarted(entityId, canonType) ? 1u : 0u);
+
+            std::vector<std::pair<std::string, runtime::Value>> serialFields;
+            for (std::size_t index = 0; index < fields.size(); ++index) {
+                const auto& field = fields[index];
+                const bool isSeq = field.synthetic && field.name.rfind("$sequence_", 0) == 0;
+                if (!isSeq &&
+                    (field.synthetic || field.staticField || field.constField ||
+                     (!field.name.empty() && field.name.front() == '$'))) {
+                    continue;
+                }
+                if (field.name == "__native" && field.type == semantic::PrimitiveType::Handle) {
+                    continue;
+                }
+                const auto value = runtime.heap()
+                    ? runtime.heap()->fieldGet(compObj->reference(), index)
+                    : std::nullopt;
+                if (!value) {
+                    fail(error, runtime::ErrorCode::InvalidObjectReference,
+                        "failed to read script field '" + field.name + "' during RSBS encode");
+                    return {};
+                }
+                serialFields.push_back({field.name, *value});
+            }
+            writer.writeU32(static_cast<std::uint32_t>(serialFields.size()));
+            for (const auto& [fname, fval] : serialFields) {
+                writer.writeString(fname);
+                if (!encodeValueBinary(runtime, &scene, fval, policy, 0, writer, error)) {
+                    return {};
+                }
+            }
+        }
+    }
+
+    const auto& conns = scene.signalConnections();
+    writer.writeU32(static_cast<std::uint32_t>(conns.size()));
+    for (const auto& conn : conns) {
+        writer.writeU64(static_cast<std::uint64_t>(conn.sourceEntity));
+        writer.writeString(conn.sourceComponent);
+        writer.writeString(conn.signalName);
+        writer.writeU64(static_cast<std::uint64_t>(conn.targetEntity));
+        writer.writeString(conn.targetComponent);
+        writer.writeString(conn.targetMethod);
+    }
+
+    const auto& overlaps2D = scene.activeOverlaps2D();
+    const auto& wasTrig2D = scene.activeOverlapWasTrigger2D();
+    writer.writeU32(static_cast<std::uint32_t>(overlaps2D.size()));
+    for (const auto& pair : overlaps2D) {
+        writer.writeU64(static_cast<std::uint64_t>(pair.first));
+        writer.writeU64(static_cast<std::uint64_t>(pair.second));
+        const auto it = wasTrig2D.find(pair);
+        writer.writeU8((it != wasTrig2D.end() && it->second) ? 1u : 0u);
+    }
+
+    const auto& overlaps3D = scene.activeOverlaps3D();
+    const auto& wasTrig3D = scene.activeOverlapWasTrigger3D();
+    writer.writeU32(static_cast<std::uint32_t>(overlaps3D.size()));
+    for (const auto& pair : overlaps3D) {
+        writer.writeU64(static_cast<std::uint64_t>(pair.first));
+        writer.writeU64(static_cast<std::uint64_t>(pair.second));
+        const auto it = wasTrig3D.find(pair);
+        writer.writeU8((it != wasTrig3D.end() && it->second) ? 1u : 0u);
+    }
+
+    const auto& curAct = scene.currentInputActions();
+    writer.writeU32(static_cast<std::uint32_t>(curAct.size()));
+    for (const auto& [k, v] : curAct) {
+        writer.writeString(k);
+        writer.writeU8(v ? 1u : 0u);
+    }
+    const auto& prevAct = scene.previousInputActions();
+    writer.writeU32(static_cast<std::uint32_t>(prevAct.size()));
+    for (const auto& [k, v] : prevAct) {
+        writer.writeString(k);
+        writer.writeU8(v ? 1u : 0u);
+    }
+    const auto& axes2D = scene.inputAxes2D();
+    writer.writeU32(static_cast<std::uint32_t>(axes2D.size()));
+    for (const auto& [k, v] : axes2D) {
+        writer.writeString(k);
+        writer.writeU32(static_cast<std::uint32_t>(v.x.raw));
+        writer.writeU32(static_cast<std::uint32_t>(v.y.raw));
+    }
+
+    struct RawEcsTableSlice {
+        std::string typeName;
+        const std::vector<std::int64_t>* entities = nullptr;
+        const std::vector<runtime::Value>* values = nullptr;
+    };
+    std::vector<RawEcsTableSlice> ecsTables;
+    if (runtime.heap()) {
+        for (const auto& tName : runtime.heap()->nativeEcsTableNames()) {
+            const auto* entIds = runtime.heap()->nativeEcsEntityIds(tName);
+            const auto* vals = runtime.heap()->nativeEcsComponentValues(tName);
+            if (entIds && vals && entIds->size() == vals->size() && !entIds->empty()) {
+                ecsTables.push_back({tName, entIds, vals});
+            }
+        }
+    }
+    writer.writeU32(static_cast<std::uint32_t>(ecsTables.size()));
+    for (const auto& tbl : ecsTables) {
+        writer.writeString(tbl.typeName);
+        writer.writeU32(static_cast<std::uint32_t>(tbl.entities->size()));
+        for (std::size_t idx = 0; idx < tbl.entities->size(); ++idx) {
+            writer.writeU64(static_cast<std::uint64_t>((*tbl.entities)[idx]));
+            if (!encodeValueBinary(runtime, &scene, (*tbl.values)[idx], policy, 0, writer, error)) {
+                return {};
+            }
+        }
+    }
+
+    if (writer.buffer().size() + 8u > policy.maximumEncodedBytes) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "RSBS binary snapshot exceeded ScriptStatePolicy maximumEncodedBytes");
+        return {};
+    }
+
+    std::uint64_t payloadHash = FnvOffset;
+    hashBytes(payloadHash, writer.buffer().data(), writer.buffer().size());
+    writer.writeU64(payloadHash);
+    return writer.take();
+}
+
+bool decodeSceneBinary(
+    SceneScriptRuntime& scene,
+    const std::vector<std::uint8_t>& bytes,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy) {
+    error = {};
+    if (bytes.size() < 16u) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "RSBS binary scene payload is truncated");
+        return false;
+    }
+    if (bytes.size() > policy.maximumEncodedBytes) {
+        fail(error, runtime::ErrorCode::DeterminismViolation,
+            "RSBS binary scene payload exceeds ScriptStatePolicy maximumEncodedBytes");
+        return false;
+    }
+
+    const std::size_t payloadLen = bytes.size() - 8u;
+    Reader r(bytes, payloadLen);
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    if (!r.readU32(magic) || !r.readU32(version)) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "failed to read RSBS binary header");
+        return false;
+    }
+    if (magic != kSceneBinaryMagic) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "invalid RSBS binary scene magic");
+        return false;
+    }
+    if (version != kSceneBinaryCodecVersion) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "unsupported RSBS binary scene codec version");
+        return false;
+    }
+
+    std::uint64_t expectedHash = FnvOffset;
+    hashBytes(expectedHash, bytes.data(), payloadLen);
+    Reader trailerReader(bytes);
+    trailerReader.setOffset(payloadLen);
+    std::uint64_t storedHash = 0;
+    if (!trailerReader.readU64(storedHash) || storedHash != expectedHash) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "RSBS binary scene payload hash mismatch");
+        return false;
+    }
+
+    struct ParsedCompFields {
+        std::string typeName;
+        bool enabled = true;
+        bool started = false;
+        std::vector<std::pair<std::string, std::size_t>> fieldOffsets; // name -> start byte offset in payload
+    };
+    struct ParsedEntity {
+        SceneEntityId id = 0;
+        bool activeSelf = true;
+        SceneEntityId parent = SceneScriptRuntime::BroadcastTarget;
+        Transform3D localTf = Transform3D::identity();
+        std::string name;
+        std::vector<std::string> groups;
+        std::optional<SceneCollider2D> col2;
+        std::optional<SceneCollider3D> col3;
+        std::vector<ParsedCompFields> components;
+    };
+    struct ParsedSignal {
+        SceneEntityId sourceEntity = 0;
+        std::string sourceComponent;
+        std::string signalName;
+        SceneEntityId targetEntity = 0;
+        std::string targetComponent;
+        std::string targetMethod;
+    };
+    struct ParsedEcsEntry {
+        std::int64_t entityId = 0;
+        std::size_t valueOffset = 0;
+    };
+    struct ParsedEcsTable {
+        std::string typeName;
+        std::vector<ParsedEcsEntry> entries;
+    };
+
+    // Helper to advance Reader cleanly past one encoded Value during structural preflight
+    auto skipEncodedValue = [&](auto& self, Reader& vr, std::size_t depth) -> bool {
+        if (depth > policy.maximumStructDepth) return false;
+        std::uint8_t tb = 0;
+        if (!vr.readU8(tb)) return false;
+        switch (static_cast<RsbsValTag>(tb)) {
+        case RsbsValTag::Monostate:
+        case RsbsValTag::NullString:
+        case RsbsValTag::NullObject:
+        case RsbsValTag::NullArray:
+            return true;
+        case RsbsValTag::Bool:
+        case RsbsValTag::Byte:
+        case RsbsValTag::SByte: {
+            std::uint8_t dummy = 0;
+            return vr.readU8(dummy);
+        }
+        case RsbsValTag::Short:
+        case RsbsValTag::UShort:
+        case RsbsValTag::UInt:
+        case RsbsValTag::Float:
+        case RsbsValTag::Char:
+        case RsbsValTag::Fixed: {
+            std::uint32_t dummy = 0;
+            return vr.readU32(dummy);
+        }
+        case RsbsValTag::Int64:
+        case RsbsValTag::Long:
+        case RsbsValTag::ULong:
+        case RsbsValTag::Double:
+        case RsbsValTag::Fixed16:
+        case RsbsValTag::Fixed64: {
+            std::uint64_t dummy = 0;
+            return vr.readU64(dummy);
+        }
+        case RsbsValTag::Enum: {
+            std::uint64_t t = 0, v = 0;
+            std::string s;
+            return vr.readU64(t) && vr.readString(s) && vr.readU64(v);
+        }
+        case RsbsValTag::Vec2:
+        case RsbsValTag::Vec2f: {
+            std::uint32_t x = 0, y = 0;
+            return vr.readU32(x) && vr.readU32(y);
+        }
+        case RsbsValTag::Vec3:
+        case RsbsValTag::Vec3f: {
+            std::uint32_t x = 0, y = 0, z = 0;
+            return vr.readU32(x) && vr.readU32(y) && vr.readU32(z);
+        }
+        case RsbsValTag::Quat:
+        case RsbsValTag::Quatf: {
+            std::uint32_t x = 0, y = 0, z = 0, w = 0;
+            return vr.readU32(x) && vr.readU32(y) && vr.readU32(z) && vr.readU32(w);
+        }
+        case RsbsValTag::String: {
+            std::string s;
+            return vr.readString(s);
+        }
+        case RsbsValTag::ComponentRef: {
+            std::uint64_t eid = 0;
+            std::string ct;
+            return vr.readU64(eid) && vr.readString(ct);
+        }
+        case RsbsValTag::Array: {
+            std::string at, et;
+            std::uint8_t ep = 0;
+            std::uint32_t len = 0;
+            if (!vr.readString(at) || !vr.readU8(ep) || !vr.readString(et) || !vr.readU32(len)) {
+                return false;
+            }
+            for (std::uint32_t i = 0; i < len; ++i) {
+                if (!self(self, vr, depth + 1u)) return false;
+            }
+            return true;
+        }
+        case RsbsValTag::Object: {
+            std::string tn;
+            std::uint32_t fc = 0;
+            if (!vr.readString(tn) || !vr.readU32(fc) || fc > policy.maximumFields) return false;
+            for (std::uint32_t i = 0; i < fc; ++i) {
+                std::string fn;
+                if (!vr.readString(fn) || !self(self, vr, depth + 1u)) return false;
+            }
+            return true;
+        }
+        case RsbsValTag::Struct: {
+            std::uint64_t stid = 0;
+            std::string tn;
+            std::uint32_t fc = 0;
+            if (!vr.readU64(stid) || !vr.readString(tn) || !vr.readU32(fc) || fc > policy.maximumFields) {
+                return false;
+            }
+            for (std::uint32_t i = 0; i < fc; ++i) {
+                if (!self(self, vr, depth + 1u)) return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+        }
+    };
+
+    std::uint32_t entityCount = 0;
+    if (!r.readU32(entityCount)) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "malformed RSBS entity count");
+        return false;
+    }
+
+    std::vector<ParsedEntity> parsedEntities;
+    parsedEntities.reserve(entityCount);
+    std::unordered_set<SceneEntityId> preEntityIds;
+    std::unordered_map<std::uint32_t, SceneEntityId> preSlotOwners;
+    std::unordered_map<SceneEntityId, SceneEntityId> preParents;
+    std::unordered_map<SceneEntityId, std::vector<ScriptType>> preEntityComps;
+
+    const auto checkEntitySlot = [&](SceneEntityId eid) -> bool {
+        const std::uint32_t slot = entityIdSlot(eid);
+        const std::uint32_t gen = entityIdGeneration(eid);
+        const auto [it, inserted] = preSlotOwners.emplace(slot, eid);
+        if (!inserted && it->second != eid) {
+            if (gen != 0u || entityIdGeneration(it->second) != 0u) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "RSBS binary scene contains colliding generational entity slot handles");
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (std::uint32_t ei = 0; ei < entityCount; ++ei) {
+        ParsedEntity pe;
+        std::uint64_t eidRaw = 0;
+        std::uint8_t activeByte = 1;
+        std::uint64_t parentRaw = 0;
+        if (!r.readU64(eidRaw) || !r.readU8(activeByte) || !r.readU64(parentRaw)) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "truncated entity header in RSBS binary scene");
+            return false;
+        }
+        pe.id = static_cast<SceneEntityId>(eidRaw);
+        pe.activeSelf = activeByte != 0;
+        pe.parent = static_cast<SceneEntityId>(parentRaw);
+        if (pe.id == SceneScriptRuntime::BroadcastTarget || !preEntityIds.insert(pe.id).second ||
+            !checkEntitySlot(pe.id)) {
+            if (error.code == runtime::ErrorCode::None) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "invalid or duplicate entity id in RSBS binary scene");
+            }
+            return false;
+        }
+        if (pe.parent != SceneScriptRuntime::BroadcastTarget) {
+            if (pe.parent == pe.id || !checkEntitySlot(pe.parent)) {
+                if (error.code == runtime::ErrorCode::None) {
+                    fail(error, runtime::ErrorCode::InvalidProgram,
+                        "invalid parent reference in RSBS binary scene");
+                }
+                return false;
+            }
+            preParents[pe.id] = pe.parent;
+        }
+        if (!readVec3Binary(r, pe.localTf.position) ||
+            !readQuatBinary(r, pe.localTf.rotation) ||
+            !readVec3Binary(r, pe.localTf.scale) ||
+            !r.readString(pe.name)) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "truncated transform/name in RSBS binary scene");
+            return false;
+        }
+        std::uint32_t grpCount = 0;
+        if (!r.readU32(grpCount)) return false;
+        pe.groups.resize(grpCount);
+        for (std::uint32_t gi = 0; gi < grpCount; ++gi) {
+            if (!r.readString(pe.groups[gi])) return false;
+        }
+
+        std::uint8_t hasCol2 = 0;
+        if (!r.readU8(hasCol2)) return false;
+        if (hasCol2 != 0) {
+            SceneCollider2D col;
+            std::uint32_t hx = 0, hy = 0, rad = 0;
+            std::uint8_t ic = 0, it = 0;
+            if (!r.readU32(hx) || !r.readU32(hy) || !r.readU32(rad) ||
+                !r.readU8(ic) || !r.readU8(it) ||
+                !r.readU32(col.layerMask) || !r.readU32(col.collisionLayer) ||
+                !r.readU32(col.collisionMask)) {
+                return false;
+            }
+            col.halfExtents.x = Fixed::fromRaw(static_cast<std::int32_t>(hx));
+            col.halfExtents.y = Fixed::fromRaw(static_cast<std::int32_t>(hy));
+            col.radius = Fixed::fromRaw(static_cast<std::int32_t>(rad));
+            col.isCircle = ic != 0;
+            col.isTrigger = it != 0;
+            pe.col2 = col;
+        }
+
+        std::uint8_t hasCol3 = 0;
+        if (!r.readU8(hasCol3)) return false;
+        if (hasCol3 != 0) {
+            SceneCollider3D col3;
+            std::uint32_t rad = 0;
+            std::uint8_t is = 0, it = 0;
+            if (!readVec3Binary(r, col3.halfExtents) || !r.readU32(rad) ||
+                !r.readU8(is) || !r.readU8(it) ||
+                !r.readU32(col3.layerMask) || !r.readU32(col3.collisionLayer) ||
+                !r.readU32(col3.collisionMask)) {
+                return false;
+            }
+            col3.radius = Fixed::fromRaw(static_cast<std::int32_t>(rad));
+            col3.isSphere = is != 0;
+            col3.isTrigger = it != 0;
+            pe.col3 = col3;
+        }
+
+        std::uint32_t compCount = 0;
+        if (!r.readU32(compCount)) return false;
+        auto& compTypes = preEntityComps[pe.id];
+        std::unordered_set<std::string> seenCanonOnEntity;
+        pe.components.reserve(compCount);
+        for (std::uint32_t ci = 0; ci < compCount; ++ci) {
+            ParsedCompFields pcf;
+            std::uint8_t enByte = 1, stByte = 0;
+            std::uint32_t fCount = 0;
+            if (!r.readString(pcf.typeName) || !r.readU8(enByte) ||
+                !r.readU8(stByte) || !r.readU32(fCount)) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "truncated component header in RSBS binary scene");
+                return false;
+            }
+            if (fCount > policy.maximumFields) {
+                fail(error, runtime::ErrorCode::DeterminismViolation,
+                    "RSBS component exceeded maximumFields");
+                return false;
+            }
+            pcf.enabled = enByte != 0;
+            pcf.started = stByte != 0;
+            const auto foundType = scene.runtime().findType(pcf.typeName);
+            if (!foundType ||
+                foundType->descriptor.kind != semantic::TypeKind::Class ||
+                foundType->descriptor.delegateType) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "unknown or non-component script type '" + pcf.typeName + "' in RSBS binary scene");
+                return false;
+            }
+            if (!seenCanonOnEntity.insert(foundType->canonicalName()).second) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "duplicate component '" + foundType->canonicalName() + "' in RSBS binary scene");
+                return false;
+            }
+            compTypes.push_back(*foundType);
+
+            pcf.fieldOffsets.reserve(fCount);
+            for (std::uint32_t fi = 0; fi < fCount; ++fi) {
+                std::string fname;
+                if (!r.readString(fname)) return false;
+                const std::size_t valOffset = r.offset();
+                if (!skipEncodedValue(skipEncodedValue, r, 0)) {
+                    fail(error, runtime::ErrorCode::InvalidProgram,
+                        "malformed field value in RSBS binary scene");
+                    return false;
+                }
+                pcf.fieldOffsets.push_back({std::move(fname), valOffset});
+            }
+            pe.components.push_back(std::move(pcf));
+        }
+        parsedEntities.push_back(std::move(pe));
+    }
+
+    for (const auto& [childId, startParent] : preParents) {
+        SceneEntityId cursor = startParent;
+        std::size_t hops = 0;
+        while (cursor != SceneScriptRuntime::BroadcastTarget && hops <= preParents.size() + 1u) {
+            if (cursor == childId) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "cyclic parent hierarchy in RSBS binary scene");
+                return false;
+            }
+            const auto pIt = preParents.find(cursor);
+            cursor = (pIt == preParents.end()) ? SceneScriptRuntime::BroadcastTarget : pIt->second;
+            ++hops;
+        }
+    }
+
+    const auto findPreComp = [&](SceneEntityId eid, const std::string& name) -> const ScriptType* {
+        const auto eIt = preEntityComps.find(eid);
+        if (eIt == preEntityComps.end() || eIt->second.empty()) return nullptr;
+        if (name.empty()) return &eIt->second.front();
+        for (const auto& ct : eIt->second) {
+            if (ct.canonicalName() == name || ct.descriptor.name == name) return &ct;
+        }
+        if (const auto wanted = scene.runtime().findType(name)) {
+            for (const auto& ct : eIt->second) {
+                if (ct.canonicalName() == wanted->canonicalName()) return &ct;
+            }
+        }
+        return nullptr;
+    };
+
+    std::uint32_t sigCount = 0;
+    if (!r.readU32(sigCount)) return false;
+    std::vector<ParsedSignal> parsedSignals;
+    parsedSignals.reserve(sigCount);
+    for (std::uint32_t si = 0; si < sigCount; ++si) {
+        ParsedSignal ps;
+        std::uint64_t se = 0, te = 0;
+        if (!r.readU64(se) || !r.readString(ps.sourceComponent) || !r.readString(ps.signalName) ||
+            !r.readU64(te) || !r.readString(ps.targetComponent) || !r.readString(ps.targetMethod) ||
+            ps.signalName.empty() || ps.targetMethod.empty()) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "malformed signal connection in RSBS binary scene");
+            return false;
+        }
+        ps.sourceEntity = static_cast<SceneEntityId>(se);
+        ps.targetEntity = static_cast<SceneEntityId>(te);
+        const auto* srcType = findPreComp(ps.sourceEntity, ps.sourceComponent);
+        const auto* dstType = findPreComp(ps.targetEntity, ps.targetComponent);
+        if (!srcType || !dstType) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "RSBS signal connection references missing entity or component");
+            return false;
+        }
+        const semantic::FieldSymbol* eventField =
+            findSignalDelegateFieldInType(*srcType, ps.signalName);
+        if (!eventField) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "RSBS signal '" + ps.signalName + "' not found on source component");
+            return false;
+        }
+        const auto delType = scene.runtime().findType(eventField->typeName);
+        if (!delType || !delType->descriptor.delegateType) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "invalid signal delegate type in RSBS binary scene");
+            return false;
+        }
+        std::size_t arity = 0;
+        bool hasInvoke = false;
+        for (const auto& m : delType->descriptor.methods) {
+            if (m.name == "Invoke") {
+                hasInvoke = true;
+                arity = m.parameters.size() > 0 ? m.parameters.size() - 1u : 0u;
+                break;
+            }
+        }
+        if (!hasInvoke || !scene.runtime().findMethod(*dstType, ps.targetMethod, arity)) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "RSBS signal target method '" + ps.targetMethod + "' not found");
+            return false;
+        }
+        parsedSignals.push_back(std::move(ps));
+    }
+
+    std::uint32_t ov2Count = 0;
+    if (!r.readU32(ov2Count)) return false;
+    std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps2D;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, bool> wasTrig2D;
+    for (std::uint32_t i = 0; i < ov2Count; ++i) {
+        std::uint64_t aRaw = 0, bRaw = 0;
+        std::uint8_t wt = 0;
+        if (!r.readU64(aRaw) || !r.readU64(bRaw) || !r.readU8(wt)) return false;
+        auto a = static_cast<SceneEntityId>(aRaw);
+        auto b = static_cast<SceneEntityId>(bRaw);
+        if (a > b) std::swap(a, b);
+        const auto p = std::make_pair(a, b);
+        activeOverlaps2D.insert(p);
+        wasTrig2D[p] = wt != 0;
+    }
+
+    std::uint32_t ov3Count = 0;
+    if (!r.readU32(ov3Count)) return false;
+    std::set<std::pair<SceneEntityId, SceneEntityId>> activeOverlaps3D;
+    std::map<std::pair<SceneEntityId, SceneEntityId>, bool> wasTrig3D;
+    for (std::uint32_t i = 0; i < ov3Count; ++i) {
+        std::uint64_t aRaw = 0, bRaw = 0;
+        std::uint8_t wt = 0;
+        if (!r.readU64(aRaw) || !r.readU64(bRaw) || !r.readU8(wt)) return false;
+        auto a = static_cast<SceneEntityId>(aRaw);
+        auto b = static_cast<SceneEntityId>(bRaw);
+        if (a > b) std::swap(a, b);
+        const auto p = std::make_pair(a, b);
+        activeOverlaps3D.insert(p);
+        wasTrig3D[p] = wt != 0;
+    }
+
+    std::map<std::string, bool> curActions, prevActions;
+    std::map<std::string, Vec2> axes2D;
+    std::uint32_t curCount = 0, prevCount = 0, axesCount = 0;
+    if (!r.readU32(curCount)) return false;
+    for (std::uint32_t i = 0; i < curCount; ++i) {
+        std::string k;
+        std::uint8_t v = 0;
+        if (!r.readString(k) || !r.readU8(v)) return false;
+        curActions[std::move(k)] = v != 0;
+    }
+    if (!r.readU32(prevCount)) return false;
+    for (std::uint32_t i = 0; i < prevCount; ++i) {
+        std::string k;
+        std::uint8_t v = 0;
+        if (!r.readString(k) || !r.readU8(v)) return false;
+        prevActions[std::move(k)] = v != 0;
+    }
+    if (!r.readU32(axesCount)) return false;
+    for (std::uint32_t i = 0; i < axesCount; ++i) {
+        std::string k;
+        std::uint32_t x = 0, y = 0;
+        if (!r.readString(k) || !r.readU32(x) || !r.readU32(y)) return false;
+        axes2D[std::move(k)] = Vec2{
+            Fixed::fromRaw(static_cast<std::int32_t>(x)),
+            Fixed::fromRaw(static_cast<std::int32_t>(y)),
+        };
+    }
+
+    std::uint32_t ecsTableCount = 0;
+    if (!r.readU32(ecsTableCount)) return false;
+    std::vector<ParsedEcsTable> parsedEcs;
+    parsedEcs.reserve(ecsTableCount);
+    for (std::uint32_t ti = 0; ti < ecsTableCount; ++ti) {
+        ParsedEcsTable pt;
+        std::uint32_t entryCount = 0;
+        if (!r.readString(pt.typeName) || !r.readU32(entryCount)) return false;
+        pt.entries.reserve(entryCount);
+        for (std::uint32_t ei = 0; ei < entryCount; ++ei) {
+            std::uint64_t entRaw = 0;
+            if (!r.readU64(entRaw)) return false;
+            const std::size_t vOff = r.offset();
+            if (!skipEncodedValue(skipEncodedValue, r, 0)) return false;
+            pt.entries.push_back({static_cast<std::int64_t>(entRaw), vOff});
+        }
+        parsedEcs.push_back(std::move(pt));
+    }
+
+    if (!r.atEnd()) {
+        fail(error, runtime::ErrorCode::InvalidProgram,
+            "trailing unconsumed bytes in RSBS binary scene");
+        return false;
+    }
+
+    // All preflight checks succeeded; clear and rebuild scene atomically.
+    scene.clearForSnapshotImport();
+    if (scene.runtime().heap()) {
+        scene.runtime().heap()->clearNativeEcsTables();
+    }
+
+    struct DeferredComp {
+        SceneEntityId entityId = 0;
+        std::size_t compSlotIdx = 0;
+        const ParsedCompFields* fields = nullptr;
+    };
+    std::vector<DeferredComp> deferredComps;
+    for (const auto& pe : parsedEntities) {
+        scene.registerImportedEntityHandle(pe.id);
+        scene.setLocalTransform(pe.id, pe.localTf);
+        if (!pe.name.empty()) {
+            scene.setEntityName(pe.id, pe.name);
+        }
+        for (const auto& g : pe.groups) {
+            scene.addEntityToGroup(pe.id, g);
+        }
+        if (pe.col2) {
+            scene.setEntityCollider2D(pe.id, *pe.col2);
+        }
+        if (pe.col3) {
+            scene.setEntityCollider3D(pe.id, *pe.col3);
+        }
+        for (const auto& comp : pe.components) {
+            const std::size_t compSlotIdx = scene.componentCount(pe.id);
+            if (!scene.restoreComponentWithoutLifecycle(
+                    pe.id, comp.typeName, comp.enabled, comp.started)) {
+                fail(error, runtime::ErrorCode::InvalidProgram,
+                    "failed to attach component '" + comp.typeName + "' during RSBS decode");
+                return false;
+            }
+            deferredComps.push_back({pe.id, compSlotIdx, &comp});
+        }
+    }
+
+    for (const auto& pe : parsedEntities) {
+        if (pe.parent != SceneScriptRuntime::BroadcastTarget && !scene.setParent(pe.id, pe.parent)) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "invalid parent hierarchy during RSBS decode");
+            return false;
+        }
+    }
+
+    auto& runtime = scene.runtime();
+    std::vector<runtime::PersistentRoot> tempRoots;
+    for (const auto& item : deferredComps) {
+        const auto compsOnEnt = scene.getComponents(item.entityId);
+        auto* compObj = item.compSlotIdx < compsOnEnt.size()
+            ? compsOnEnt[item.compSlotIdx]
+            : scene.getComponent(item.entityId, item.fields->typeName);
+        if (!compObj) return false;
+        for (const auto& [fname, vOffset] : item.fields->fieldOffsets) {
+            r.setOffset(vOffset);
+            runtime::Value decodedVal;
+            if (!decodeValueBinary(runtime, &scene, r, policy, 0, tempRoots, decodedVal, error)) {
+                if (error.code == runtime::ErrorCode::None) {
+                    fail(error, runtime::ErrorCode::InvalidProgram,
+                        "failed to decode field '" + fname + "' from RSBS payload");
+                }
+                return false;
+            }
+            bool matchedSeq = false;
+            if (fname.rfind("$sequence_", 0) == 0) {
+                for (const auto& fdesc : compObj->type().descriptor.fields) {
+                    if (fdesc.name == fname && runtime.heap()) {
+                        if (!runtime.heap()->fieldSet(
+                                compObj->reference(), fdesc.index, std::move(decodedVal), &error)) {
+                            return false;
+                        }
+                        matchedSeq = true;
+                        break;
+                    }
+                }
+            }
+            if (!matchedSeq && !runtime.setMember(*compObj, fname, decodedVal, error)) {
+                return false;
+            }
+        }
+    }
+
+    for (const auto& ps : parsedSignals) {
+        if (!scene.connectSignal(
+                ps.sourceEntity, ps.sourceComponent, ps.signalName,
+                ps.targetEntity, ps.targetComponent, ps.targetMethod)) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "failed to restore signal '" + ps.signalName + "' during RSBS decode");
+            return false;
+        }
+    }
+
+    for (const auto& pe : parsedEntities) {
+        scene.restoreEntityActiveWithoutLifecycle(pe.id, pe.activeSelf);
+    }
+
+    scene.restorePhysicsOverlapState(std::move(activeOverlaps2D), std::move(wasTrig2D));
+    scene.restorePhysicsOverlapState3D(std::move(activeOverlaps3D), std::move(wasTrig3D));
+    scene.restoreInputSnapshot(
+        std::move(curActions), std::move(prevActions), std::move(axes2D));
+
+    if (runtime.heap()) {
+        for (const auto& pt : parsedEcs) {
+            for (const auto& entry : pt.entries) {
+                r.setOffset(entry.valueOffset);
+                runtime::Value decodedVal;
+                if (!decodeValueBinary(runtime, &scene, r, policy, 0, tempRoots, decodedVal, error)) {
+                    return false;
+                }
+                (void)runtime.heap()->setNativeEcsComponent(
+                    pt.typeName, entry.entityId, std::move(decodedVal));
+            }
+        }
+    }
+    return true;
+}
+
 std::optional<RollbackFrameSnapshot> captureRollbackFrame(
     const SceneScriptRuntime& scene,
     const GameplayHost& host,
@@ -2392,14 +4057,14 @@ std::optional<RollbackFrameSnapshot> captureRollbackFrame(
             "failed to encode GameplayHost state: " + hostErr.message);
         return std::nullopt;
     }
-    snap.sceneJson = exportSceneJson(scene, error, policy);
-    if (error.code != runtime::ErrorCode::None || snap.sceneJson.empty()) {
+    snap.sceneBinary = encodeSceneBinary(scene, error, policy);
+    if (error.code != runtime::ErrorCode::None || snap.sceneBinary.empty()) {
         return std::nullopt;
     }
     std::uint64_t hash = FnvOffset;
     hashU64(hash, snap.tick);
     hashBytes(hash, snap.hostStateBytes.data(), snap.hostStateBytes.size());
-    hashString(hash, snap.sceneJson);
+    hashBytes(hash, snap.sceneBinary.data(), snap.sceneBinary.size());
     snap.frameHash = hash;
     return snap;
 }
@@ -2414,14 +4079,26 @@ bool restoreRollbackFrame(
     std::uint64_t expectedHash = FnvOffset;
     hashU64(expectedHash, snapshot.tick);
     hashBytes(expectedHash, snapshot.hostStateBytes.data(), snapshot.hostStateBytes.size());
-    hashString(expectedHash, snapshot.sceneJson);
-    if (expectedHash != snapshot.frameHash) {
-        fail(error, runtime::ErrorCode::InvalidProgram,
-            "rollback frame snapshot hash mismatch");
-        return false;
-    }
-    if (!importSceneJson(scene, snapshot.sceneJson, error, policy)) {
-        return false;
+    if (!snapshot.sceneBinary.empty()) {
+        hashBytes(expectedHash, snapshot.sceneBinary.data(), snapshot.sceneBinary.size());
+        if (expectedHash != snapshot.frameHash) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "rollback frame snapshot hash mismatch");
+            return false;
+        }
+        if (!decodeSceneBinary(scene, snapshot.sceneBinary, error, policy)) {
+            return false;
+        }
+    } else {
+        hashString(expectedHash, snapshot.sceneJson);
+        if (expectedHash != snapshot.frameHash) {
+            fail(error, runtime::ErrorCode::InvalidProgram,
+                "rollback frame snapshot hash mismatch");
+            return false;
+        }
+        if (!importSceneJson(scene, snapshot.sceneJson, error, policy)) {
+            return false;
+        }
     }
     GameplayStateError hostErr;
     if (!restoreGameplayHostState(host, snapshot.hostStateBytes, hostErr)) {

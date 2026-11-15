@@ -1,6 +1,7 @@
 #include <cstring>
 #include "realscript/game/GameScripting.h"
 #include "realscript/game/GameplayMetadata.h"
+#include "realscript/runtime/DebugHook.h"
 
 #include <algorithm>
 #include <array>
@@ -770,7 +771,7 @@ struct HotReloadCoroBridge {
     std::shared_ptr<const void> innerRunnerOwner{};
     semantic::SymbolId trampolineSymbolId = 0;
     runtime::ExecutionOptions executionOptions{};
-    std::shared_ptr<debug::DebugController> fallbackDebugger{};
+    std::shared_ptr<debug::RuntimeDebugHook> fallbackDebugger{};
     std::shared_ptr<const runtime::ProgramImage> targetProgram{};
     std::unique_ptr<runtime::Interpreter> interpreter{};
 
@@ -851,7 +852,7 @@ struct HotReloadCoroBridge {
 std::shared_ptr<HotReloadCoroBridge> createHotReloadCoroBridge(
     const GameProgram& newProgram,
     const std::shared_ptr<const runtime::BindingRegistry>& fallbackBindings,
-    const std::shared_ptr<debug::DebugController>& fallbackDebugger,
+    const std::shared_ptr<debug::RuntimeDebugHook>& fallbackDebugger,
     const std::shared_ptr<runtime::ManagedHeap>& heap,
     const std::shared_ptr<runtime::AsyncRuntimeContext>& asyncCtx,
     const runtime::ExecutionOptions& execOpts,
@@ -4052,6 +4053,51 @@ bool SceneScriptRuntime::setInspectorMember(
     return false;
 }
 
+namespace {
+
+const semantic::FieldSymbol* findSignalDelegateField(
+    const ScriptType& type,
+    const std::string& signalName) {
+    if (signalName.empty()) return nullptr;
+    const auto findByBase = [&](const std::string& baseName) -> const semantic::FieldSymbol* {
+        const std::string backingFieldName = "$event_" + baseName + "_delegate";
+        for (const auto& field : type.descriptor.fields) {
+            if (field.name == backingFieldName &&
+                field.type == semantic::PrimitiveType::Object) {
+                return &field;
+            }
+        }
+        return nullptr;
+    };
+    if (const auto* direct = findByBase(signalName)) {
+        return direct;
+    }
+    constexpr std::string_view kEventSuffix = "Event";
+    if (signalName.size() <= kEventSuffix.size() ||
+        signalName.compare(
+            signalName.size() - kEventSuffix.size(),
+            kEventSuffix.size(),
+            kEventSuffix) != 0) {
+        if (const auto* standardMacroEvent = findByBase(signalName + "Event")) {
+            return standardMacroEvent;
+        }
+    }
+    return nullptr;
+}
+
+bool signalNamesEquivalent(
+    const ScriptType* srcType,
+    const std::string& lhs,
+    const std::string& rhs) {
+    if (lhs == rhs) return true;
+    if (!srcType) return false;
+    const auto* lhsField = findSignalDelegateField(*srcType, lhs);
+    const auto* rhsField = findSignalDelegateField(*srcType, rhs);
+    return lhsField != nullptr && lhsField == rhsField;
+}
+
+} // namespace
+
 bool SceneScriptRuntime::rebuildSignalDelegateChain(
     SceneEntityId sourceEntity,
     const std::string& sourceComponent,
@@ -4061,15 +4107,8 @@ bool SceneScriptRuntime::rebuildSignalDelegateChain(
         : getComponent(sourceEntity, sourceComponent);
     if (!srcObj || signalName.empty()) return false;
 
-    const std::string backingFieldName = "$event_" + signalName + "_delegate";
-    const semantic::FieldSymbol* eventField = nullptr;
-    for (const auto& field : srcObj->type().descriptor.fields) {
-        if (field.name == backingFieldName &&
-            field.type == semantic::PrimitiveType::Object) {
-            eventField = &field;
-            break;
-        }
-    }
+    const semantic::FieldSymbol* eventField =
+        findSignalDelegateField(srcObj->type(), signalName);
     if (!eventField) return false;
 
     const auto delegateType = runtime_.findType(eventField->typeName);
@@ -4092,7 +4131,8 @@ bool SceneScriptRuntime::rebuildSignalDelegateChain(
     runtime::PersistentRoot chainHeadRoot;
 
     for (const auto& conn : signalConnections_) {
-        if (conn.sourceEntity != sourceEntity || conn.signalName != signalName) {
+        if (conn.sourceEntity != sourceEntity ||
+            !signalNamesEquivalent(&srcObj->type(), conn.signalName, signalName)) {
             continue;
         }
         if (!sourceComponent.empty() && !conn.sourceComponent.empty() &&
@@ -4208,15 +4248,8 @@ bool SceneScriptRuntime::connectSignal(
         return false;
     }
 
-    const std::string backingFieldName = "$event_" + signalName + "_delegate";
-    const semantic::FieldSymbol* eventField = nullptr;
-    for (const auto& field : srcObj->type().descriptor.fields) {
-        if (field.name == backingFieldName &&
-            field.type == semantic::PrimitiveType::Object) {
-            eventField = &field;
-            break;
-        }
-    }
+    const semantic::FieldSymbol* eventField =
+        findSignalDelegateField(srcObj->type(), signalName);
     if (!eventField) return false;
 
     const auto delegateType = runtime_.findType(eventField->typeName);
@@ -4243,7 +4276,7 @@ bool SceneScriptRuntime::connectSignal(
     for (const auto& existing : signalConnections_) {
         if (existing.sourceEntity == sourceEntity &&
             existing.sourceComponent == resolvedSrcComp &&
-            existing.signalName == signalName &&
+            signalNamesEquivalent(&srcObj->type(), existing.signalName, signalName) &&
             existing.targetEntity == targetEntity &&
             existing.targetComponent == resolvedDstComp &&
             existing.targetMethod == targetMethod) {
@@ -4283,7 +4316,9 @@ bool SceneScriptRuntime::disconnectSignal(
         const bool srcMatch = it->sourceEntity == sourceEntity &&
             (sourceComponent.empty() || it->sourceComponent == resolvedSrcComp ||
              it->sourceComponent == sourceComponent);
-        const bool sigMatch = it->signalName == signalName;
+        const bool sigMatch = srcObj
+            ? signalNamesEquivalent(&srcObj->type(), it->signalName, signalName)
+            : (it->signalName == signalName);
         const bool dstMatch = it->targetEntity == targetEntity &&
             (targetComponent.empty() || it->targetComponent == resolvedDstComp ||
              it->targetComponent == targetComponent) &&
@@ -4845,15 +4880,19 @@ std::size_t SceneScriptRuntime::emitSignal(
     const std::string resolvedSrcComp = srcObj ? srcObj->type().canonicalName() : sourceComponent;
 
     std::size_t invokedCount = 0;
+    bool matchedRegisteredConnection = false;
     const auto connectionsSnapshot = signalConnections_;
     for (const auto& conn : connectionsSnapshot) {
-        if (conn.sourceEntity != sourceEntity || conn.signalName != signalName) {
-            continue;
-        }
+        if (conn.sourceEntity != sourceEntity) continue;
+        const bool sigMatch = srcObj
+            ? signalNamesEquivalent(&srcObj->type(), conn.signalName, signalName)
+            : (conn.signalName == signalName);
+        if (!sigMatch) continue;
         if (!sourceComponent.empty() && conn.sourceComponent != resolvedSrcComp &&
             conn.sourceComponent != sourceComponent) {
             continue;
         }
+        matchedRegisteredConnection = true;
         const auto foundTarget = instances_.find(conn.targetEntity);
         if (foundTarget == instances_.end()) continue;
         for (auto& targetInst : foundTarget->second) {
@@ -4876,6 +4915,39 @@ std::size_t SceneScriptRuntime::emitSignal(
                 ++invokedCount;
             }
             break;
+        }
+    }
+
+    // If no C++ signal connection handled this signal yet, also support script-subscribed
+    // [Signal] partial handlers / event delegates on srcObj without double-firing C++ chains.
+    if (!matchedRegisteredConnection && srcObj && runtime_.heap()) {
+        if (const auto* sigField = findSignalDelegateField(srcObj->type(), signalName)) {
+            const auto delVal = runtime_.heap()->fieldGet(
+                srcObj->reference(), sigField->index);
+            const auto* delRef = delVal ? std::get_if<runtime::ObjectRef>(&*delVal) : nullptr;
+            if (delRef && delRef->valid()) {
+                if (const auto* sigMethod = findCachedMethod(
+                        srcObj->type(), signalName, arguments.size())) {
+                    const auto res = runtime_.invoke(
+                        *srcObj, *sigMethod, arguments, executionOptions_);
+                    if (consumeFireAndForgetInvocationResult(
+                            sourceEntity, *sigMethod, res, signalName)) {
+                        ++invokedCount;
+                    }
+                } else if (const auto delType = runtime_.findType(sigField->typeName)) {
+                    if (const auto* invokeMeth = findCachedMethod(
+                            *delType, "Invoke", arguments.size())) {
+                        auto delRoot = runtime_.heap()->retain(*delRef);
+                        ScriptObject delObj(*delType, *delRef, std::move(delRoot));
+                        const auto res = runtime_.invoke(
+                            delObj, *invokeMeth, arguments, executionOptions_);
+                        if (consumeFireAndForgetInvocationResult(
+                                sourceEntity, *invokeMeth, res, signalName)) {
+                            ++invokedCount;
+                        }
+                    }
+                }
+            }
         }
     }
 

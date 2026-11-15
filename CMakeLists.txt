@@ -12,7 +12,7 @@ option(REALSCRIPT_GAMEPACK_WARNINGS_AS_ERRORS "Treat compiler warnings as errors
 
 set(REALSCRIPT_SOURCE_DIR "" CACHE PATH "Optional path to a local RealScript source tree when building bundled")
 
-if(NOT TARGET RealScript::Runtime)
+if(NOT TARGET RealScript::SlimRuntime)
     if(REALSCRIPT_SOURCE_DIR AND EXISTS "${REALSCRIPT_SOURCE_DIR}/CMakeLists.txt")
         add_subdirectory("${REALSCRIPT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/_deps/realscript")
     else()
@@ -20,8 +20,18 @@ if(NOT TARGET RealScript::Runtime)
     endif()
 endif()
 
-if(NOT TARGET RealScript::BindGen)
-    message(FATAL_ERROR "RealScriptGamePack requires RealScript::BindGen (configure RealScript with REALSCRIPT_ENABLE_BINDGEN=ON)")
+if(NOT TARGET RealScript::SlimRuntime OR NOT TARGET RealScript::BindGenRuntime OR
+   NOT TARGET RealScript::StencilJit OR NOT TARGET RealScript::HotReload)
+    message(FATAL_ERROR "RealScriptGamePack requires RealScript::SlimRuntime, RealScript::BindGenRuntime, RealScript::StencilJit, and RealScript::HotReload")
+endif()
+
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+    if(NOT TARGET RealScript::Frontend)
+        message(FATAL_ERROR "Full RealScriptGamePack build requires RealScript::Frontend")
+    endif()
+    if(NOT TARGET RealScript::BindGen)
+        message(FATAL_ERROR "Full RealScriptGamePack build requires RealScript::BindGen (configure RealScript with REALSCRIPT_ENABLE_BINDGEN=ON)")
+    endif()
 endif()
 
 function(realscript_gamepack_enable_cxx_warnings target)
@@ -46,8 +56,7 @@ if(MSVC)
     )
 endif()
 
-add_library(realscript_app_game_sdk STATIC
-    src/game/GameScripting.cpp
+add_library(realscript_game_runtime STATIC
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
     src/game/ScriptValueRuntime.cpp
@@ -59,62 +68,100 @@ add_library(realscript_app_game_sdk STATIC
     src/game/GameplayScripting.cpp
     src/game/GameplayStateCodec.cpp
 )
-set_target_properties(realscript_app_game_sdk PROPERTIES
+set_target_properties(realscript_game_runtime PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     LINKER_LANGUAGE CXX
-    EXPORT_NAME GameSdk
+    EXPORT_NAME GameRuntime
 )
-target_include_directories(realscript_app_game_sdk
+target_include_directories(realscript_game_runtime
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_compile_features(realscript_app_game_sdk PUBLIC cxx_std_17)
-realscript_gamepack_enable_cxx_warnings(realscript_app_game_sdk)
-target_link_libraries(realscript_app_game_sdk PUBLIC
-    RealScript::BindGen
-    RealScript::Runtime
-    RealScript::Compiler
-    RealScript::NativeBackends
+target_compile_features(realscript_game_runtime PUBLIC cxx_std_17)
+realscript_gamepack_enable_cxx_warnings(realscript_game_runtime)
+target_link_libraries(realscript_game_runtime PUBLIC
+    RealScript::SlimRuntime
+    RealScript::StencilJit
+    RealScript::HotReload
+    RealScript::BindGenRuntime
 )
-if(TARGET RealScript::Debug)
-    target_link_libraries(realscript_app_game_sdk PUBLIC RealScript::Debug)
-    target_compile_definitions(realscript_app_game_sdk PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=1)
-else()
-    target_compile_definitions(realscript_app_game_sdk PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=0)
-endif()
-add_library(RealScript::GameSdk ALIAS realscript_app_game_sdk)
-
-add_library(realscript_game_runtime INTERFACE)
-target_link_libraries(realscript_game_runtime INTERFACE realscript_app_game_sdk)
-set_target_properties(realscript_game_runtime PROPERTIES EXPORT_NAME GameRuntime)
+target_compile_definitions(realscript_game_runtime PRIVATE REALSCRIPT_HAS_DEBUG_SERVICES=0)
 add_library(RealScript::GameRuntime ALIAS realscript_game_runtime)
 
-add_library(realscript_game_compiler INTERFACE)
-target_link_libraries(realscript_game_compiler INTERFACE realscript_app_game_sdk)
-set_target_properties(realscript_game_compiler PROPERTIES EXPORT_NAME GameCompiler)
-add_library(RealScript::GameCompiler ALIAS realscript_game_compiler)
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+    add_library(realscript_game_compiler STATIC
+        src/game/GameScriptCompiler.cpp
+    )
+    set_target_properties(realscript_game_compiler PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LINKER_LANGUAGE CXX
+        EXPORT_NAME GameCompiler
+    )
+    target_include_directories(realscript_game_compiler
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_compile_features(realscript_game_compiler PUBLIC cxx_std_17)
+    realscript_gamepack_enable_cxx_warnings(realscript_game_compiler)
+    target_link_libraries(realscript_game_compiler PUBLIC
+        RealScript::GameRuntime
+        RealScript::Frontend
+        RealScript::BindGen
+        RealScript::NativeBackends
+    )
+    if(TARGET RealScript::Debug)
+        target_link_libraries(realscript_game_compiler PUBLIC RealScript::Debug)
+        target_compile_definitions(realscript_game_compiler PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=1)
+    else()
+        target_compile_definitions(realscript_game_compiler PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=0)
+    endif()
+    add_library(RealScript::GameCompiler ALIAS realscript_game_compiler)
 
-if(REALSCRIPT_GAMEPACK_BUILD_BENCHMARKS)
-    add_executable(rsbench_product benchmarks/product_macro_driver.cpp)
-    target_link_libraries(rsbench_product PRIVATE RealScript::GameSdk RealScript::Full)
-    target_compile_features(rsbench_product PRIVATE cxx_std_17)
-    realscript_gamepack_enable_cxx_warnings(rsbench_product)
+    add_library(realscript_app_game_sdk INTERFACE)
+    target_link_libraries(realscript_app_game_sdk INTERFACE
+        realscript_game_compiler
+        RealScript::Runtime
+        RealScript::Compiler
+    )
+    set_target_properties(realscript_app_game_sdk PROPERTIES EXPORT_NAME GameSdk)
+    add_library(RealScript::GameSdk ALIAS realscript_app_game_sdk)
+
+    if(REALSCRIPT_GAMEPACK_BUILD_BENCHMARKS)
+        add_executable(rsbench_product benchmarks/product_macro_driver.cpp)
+        target_link_libraries(rsbench_product PRIVATE RealScript::GameSdk RealScript::Full)
+        target_compile_features(rsbench_product PRIVATE cxx_std_17)
+        realscript_gamepack_enable_cxx_warnings(rsbench_product)
+    endif()
+
+    if(REALSCRIPT_GAMEPACK_BUILD_TESTS)
+        enable_testing()
+        add_executable(realscript_app_game_sdk_and_scene_tests
+            tests/app_game_sdk_and_scene_tests.cpp)
+        target_link_libraries(realscript_app_game_sdk_and_scene_tests PRIVATE RealScript::GameSdk)
+        target_compile_features(realscript_app_game_sdk_and_scene_tests PRIVATE cxx_std_17)
+        realscript_gamepack_enable_cxx_warnings(realscript_app_game_sdk_and_scene_tests)
+        add_test(
+            NAME realscript.gamepack.sdk-and-scene
+            COMMAND realscript_app_game_sdk_and_scene_tests)
+    endif()
 endif()
 
 if(REALSCRIPT_GAMEPACK_BUILD_TESTS)
     enable_testing()
-    add_executable(realscript_app_game_sdk_and_scene_tests
-        tests/app_game_sdk_and_scene_tests.cpp)
-    target_link_libraries(realscript_app_game_sdk_and_scene_tests PRIVATE RealScript::GameSdk)
-    target_compile_features(realscript_app_game_sdk_and_scene_tests PRIVATE cxx_std_17)
-    realscript_gamepack_enable_cxx_warnings(realscript_app_game_sdk_and_scene_tests)
+    add_executable(realscript_game_runtime_slim_tests
+        tests/game_runtime_slim_tests.cpp)
+    target_link_libraries(realscript_game_runtime_slim_tests PRIVATE RealScript::GameRuntime)
+    target_compile_features(realscript_game_runtime_slim_tests PRIVATE cxx_std_17)
+    target_compile_definitions(realscript_game_runtime_slim_tests PRIVATE REALSCRIPT_HAS_DEBUG_SERVICES=0)
+    realscript_gamepack_enable_cxx_warnings(realscript_game_runtime_slim_tests)
     add_test(
-        NAME realscript.gamepack.sdk-and-scene
-        COMMAND realscript_app_game_sdk_and_scene_tests)
+        NAME realscript.gamepack.runtime-slim
+        COMMAND realscript_game_runtime_slim_tests)
 endif()
 
-if(REALSCRIPT_GAMEPACK_INSTALL_SDK)
+if(REALSCRIPT_GAMEPACK_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
     install(
         TARGETS
             realscript_app_game_sdk

@@ -1,3 +1,4 @@
+#include "realscript/game/GameScriptCompiler.h"
 #include "realscript/game/GameScripting.h"
 #include "realscript/game/GameplayScripting.h"
 

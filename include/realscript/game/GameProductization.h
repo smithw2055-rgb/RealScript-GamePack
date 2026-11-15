@@ -104,14 +104,6 @@ struct GamePackageContractEnvelope {
     const std::vector<std::vector<std::uint8_t>>& encodedModules,
     const AbiContractManifest& hostManifest = currentAbiContractManifest());
 
-struct ScriptStatePolicy {
-    bool allowStrings = true;
-    bool allowDoubles = false;
-    std::size_t maximumFields = 4096;
-    std::size_t maximumStructDepth = 32;
-    std::size_t maximumEncodedBytes = 16u * 1024u * 1024u;
-};
-
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4324)
@@ -184,6 +176,7 @@ bool importSceneJson(
 struct RollbackFrameSnapshot {
     GameTick tick = 0;
     std::vector<std::uint8_t> hostStateBytes;
+    std::vector<std::uint8_t> sceneBinary;
     std::string sceneJson;
     std::uint64_t frameHash = 0;
 };

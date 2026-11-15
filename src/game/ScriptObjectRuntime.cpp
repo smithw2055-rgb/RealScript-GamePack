@@ -1,4 +1,5 @@
 #include "realscript/game/GameScripting.h"
+#include "realscript/runtime/DebugHook.h"
 
 #include <utility>
 
@@ -89,7 +90,7 @@ ScriptRuntime::ScriptRuntime(
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles)
     : program_(std::move(program)),
       bindings_(std::move(bindings)),
-      heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
+      heap_(heap ? std::move(heap) : createIsolatedHeap()),
       nativeHandles_(nativeHandles
           ? std::move(nativeHandles)
           : std::make_shared<runtime::NativeHandleRegistry>()),
@@ -97,6 +98,18 @@ ScriptRuntime::ScriptRuntime(
       interpreter_(program_, heap_) {
     interpreter_.setBindingRegistry(bindings_);
     interpreter_.setAsyncRuntime(asyncRuntime_);
+}
+
+ScriptRuntime ScriptRuntime::createIsolated(const GameProgram& program) {
+    return ScriptRuntime(
+        program.program(),
+        program.bindings(),
+        createIsolatedHeap(),
+        program.nativeHandles());
+}
+
+std::shared_ptr<runtime::ValuePoolDomain> ScriptRuntime::valuePoolDomain() const noexcept {
+    return heap_ ? heap_->valuePoolDomain() : nullptr;
 }
 
 void ScriptRuntime::setAsyncRuntime(
@@ -108,6 +121,9 @@ void ScriptRuntime::setAsyncRuntime(
     interpreter_.setAsyncRuntime(asyncRuntime_);
     if (nativeProgram_) {
         nativeProgram_->setAsyncRuntime(asyncRuntime_);
+    }
+    if (stencilModule_) {
+        stencilModule_->setAsyncRuntime(asyncRuntime_);
     }
 }
 
@@ -471,10 +487,15 @@ bool ScriptRuntime::isTypeAssignable(
 }
 
 void ScriptRuntime::replaceProgram(const GameProgram& program) {
+    const bool preserveStencilJit =
+        stencilJitEnabled_ || backend_ == ScriptExecutionBackend::StencilJit;
+    const jit::StencilJitOptions savedStencilOptions = stencilJitOptions_;
+
     program_ = program.program();
     if (program.bindings()) {
         bindings_ = program.bindings();
     }
+    runtime::ScopedValuePoolDomain domainScope(heap_ ? heap_->valuePoolDomain().get() : nullptr);
     if (!asyncRuntime_) {
         asyncRuntime_ = std::make_shared<runtime::AsyncRuntimeContext>(heap_.get());
     } else {
@@ -484,65 +505,26 @@ void ScriptRuntime::replaceProgram(const GameProgram& program) {
     interpreter_.setBindingRegistry(bindings_);
     interpreter_.setAsyncRuntime(asyncRuntime_);
     clearNativeBackend();
-#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
-    if (remoteDebugger_) {
-        remoteDebugger_->rebindProgram(program_);
-    } else
-#endif
-    if (debugger_ && program_) {
+    if (preserveStencilJit) {
+        (void)enableStencilJit(true, savedStencilOptions);
+    }
+    if (remoteDebugger_ && remoteDebuggerRebind_) {
+        remoteDebuggerRebind_(remoteDebugger_, program_);
+    } else if (debugger_ && program_) {
         debugger_->bindProgram(*program_);
     }
 }
 
-void ScriptRuntime::setDebugger(std::shared_ptr<debug::DebugController> debugger) noexcept {
+void ScriptRuntime::setDebugger(std::shared_ptr<debug::RuntimeDebugHook> debugger) noexcept {
     debugger_ = std::move(debugger);
     if (debugger_ && program_) {
         debugger_->bindProgram(*program_);
     }
 }
 
-bool ScriptRuntime::startRemoteDebugger(
-    std::uint16_t port,
-    const std::string& bindAddress) {
-#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
-    if (!remoteDebugger_) {
-        remoteDebugger_ = std::make_shared<debug::EmbeddedDapServer>(program_, heap_);
-    } else {
-        remoteDebugger_->rebindProgram(program_);
-    }
-    if (!remoteDebugger_->start(port, bindAddress)) {
-        return false;
-    }
-    debugger_ = remoteDebugger_->controller();
-    return true;
-#else
-    (void)port;
-    (void)bindAddress;
-    return false;
-#endif
-}
-
-void ScriptRuntime::stopRemoteDebugger() noexcept {
-#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
-    if (remoteDebugger_) {
-        if (debugger_ == remoteDebugger_->controller()) {
-            debugger_.reset();
-        }
-        remoteDebugger_->stop();
-        remoteDebugger_.reset();
-    }
-#endif
-}
-
-std::uint16_t ScriptRuntime::remoteDebuggerPort() const noexcept {
-#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
-    return remoteDebugger_ ? remoteDebugger_->boundPort() : 0;
-#else
-    return 0;
-#endif
-}
-
 void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
+    stencilJitEnabled_ = false;
+    stencilModule_.reset();
     jitModule_.reset();
     if (!descriptor) {
         nativeProgram_.reset();
@@ -556,22 +538,63 @@ void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
     backend_ = ScriptExecutionBackend::Aot;
 }
 
-void ScriptRuntime::setJitBackend(std::shared_ptr<jit::Module> jitModule) {
-    if (!jitModule || !jitModule->valid() || !jitModule->descriptor()) {
-        clearNativeBackend();
+bool ScriptRuntime::enableStencilJit(bool enable, jit::StencilJitOptions options) {
+    if (!enable) {
+        stencilJitEnabled_ = false;
+        stencilModule_.reset();
+        if (backend_ == ScriptExecutionBackend::StencilJit) {
+            backend_ = ScriptExecutionBackend::Interpreter;
+        }
+        return true;
+    }
+    stencilJitEnabled_ = true;
+    stencilJitOptions_ = options;
+    stencilModule_.reset();
+    if (!program_) {
+        if (backend_ == ScriptExecutionBackend::StencilJit) {
+            backend_ = ScriptExecutionBackend::Interpreter;
+        }
+        return false;
+    }
+
+    runtime::ScopedValuePoolDomain domainScope(heap_ ? heap_->valuePoolDomain().get() : nullptr);
+    jit::StencilJit jit;
+    auto compiled = jit.compile(program_, stencilJitOptions_);
+    if (!compiled.succeeded() || !compiled.module || !compiled.module->valid()) {
+        if (backend_ == ScriptExecutionBackend::StencilJit) {
+            backend_ = ScriptExecutionBackend::Interpreter;
+        }
+        return false;
+    }
+
+    setStencilJitBackend(std::move(compiled.module), stencilJitOptions_);
+    return true;
+}
+
+void ScriptRuntime::setStencilJitBackend(
+    std::shared_ptr<jit::StencilModule> stencilModule,
+    jit::StencilJitOptions options) {
+    stencilJitOptions_ = options;
+    if (!stencilModule || !stencilModule->valid()) {
+        stencilModule_.reset();
+        if (backend_ == ScriptExecutionBackend::StencilJit) {
+            backend_ = ScriptExecutionBackend::Interpreter;
+        }
         return;
     }
-    jitModule_ = std::move(jitModule);
-    jitModule_->setBindings(bindings_);
-    jitModule_->setHeap(heap_);
-    nativeProgram_ = std::make_shared<aot::Program>(*jitModule_->descriptor());
-    nativeProgram_->setBindings(bindings_);
-    nativeProgram_->setHeap(heap_);
-    nativeProgram_->setAsyncRuntime(asyncRuntime_);
-    backend_ = ScriptExecutionBackend::Jit;
+    stencilJitEnabled_ = true;
+    jitModule_.reset();
+    nativeProgram_.reset();
+    stencilModule_ = std::move(stencilModule);
+    stencilModule_->setBindings(bindings_);
+    stencilModule_->setHeap(heap_);
+    stencilModule_->setAsyncRuntime(asyncRuntime_);
+    backend_ = ScriptExecutionBackend::StencilJit;
 }
 
 void ScriptRuntime::clearNativeBackend() noexcept {
+    stencilJitEnabled_ = false;
+    stencilModule_.reset();
     jitModule_.reset();
     nativeProgram_.reset();
     backend_ = ScriptExecutionBackend::Interpreter;

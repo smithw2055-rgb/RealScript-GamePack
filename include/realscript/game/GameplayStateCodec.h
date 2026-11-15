@@ -10,7 +10,19 @@
 
 namespace realscript::game {
 
+class SceneScriptRuntime;
+
 constexpr std::uint32_t kGameplayStateCodecVersion = 1;
+constexpr std::uint32_t kSceneBinaryCodecVersion = 1;
+constexpr std::uint32_t kSceneBinaryMagic = 0x53425352u; // "RSBS"
+
+struct ScriptStatePolicy {
+    bool allowStrings = true;
+    bool allowDoubles = false;
+    std::size_t maximumFields = 4096;
+    std::size_t maximumStructDepth = 32;
+    std::size_t maximumEncodedBytes = 16u * 1024u * 1024u;
+};
 
 enum class GameplayStateErrorCode {
     None,
@@ -85,6 +97,17 @@ struct FieldSchemaDescriptor {
     const std::map<std::string, GameplayValue>& savedFields,
     const std::vector<FieldSchemaDescriptor>& newSchema,
     const std::map<std::string, GameplayValue>& defaultValues = {});
+
+[[nodiscard]] std::vector<std::uint8_t> encodeSceneBinary(
+    const SceneScriptRuntime& scene,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
+
+bool decodeSceneBinary(
+    SceneScriptRuntime& scene,
+    const std::vector<std::uint8_t>& bytes,
+    runtime::RuntimeError& error,
+    ScriptStatePolicy policy = {});
 
 [[nodiscard]] const char* gameplayStateErrorCodeName(
     GameplayStateErrorCode code) noexcept;
