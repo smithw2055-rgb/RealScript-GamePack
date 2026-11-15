@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(RealScript CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/RealScriptGamePackTargets.cmake")
+
+set(RealScriptGamePack_VERSION "@PROJECT_VERSION@")
