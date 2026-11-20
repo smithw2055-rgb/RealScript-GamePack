@@ -14,11 +14,21 @@ Standalone **L2** Game Engine SDK, Scene Script Runtime, Deterministic Gameplay 
 - `RealScript::GameRuntime` — Runtime-only game scripting SDK (`ScriptRuntime`, `SceneScriptRuntime`, `GameplayHost`, `GameplayStateCodec`, `ResourceRegistry`, `GameProductization`, `ReflectionRegistry`, `ModHost`). Compatible with `-DREALSCRIPT_SLIM_RUNTIME=ON`.
 - `RealScript::GameCompiler` — Game-side compiler integration (`GameApi`, `GameScriptCompiler`, `.d.rscript` host declarations).
 - `RealScript::GameSdk` (alias target `realscript_app_game_sdk`) — Combined compiler + runtime + scene + gameplay umbrella target (available when `REALSCRIPT_SLIM_RUNTIME=OFF`).
-- `rsbench_product` — Product-scale coroutine/rollback benchmark driver (built when `REALSCRIPT_BUILD_BENCHMARKS=ON`).
+- `rsbench_product` — Product-scale coroutine/rollback benchmark driver (built when `REALSCRIPT_GAMEPACK_BUILD_BENCHMARKS=ON`).
 
 ## Build
 
-### 1. Against an installed `RealScript` SDK
+### 1. Against a prebuilt `RealScript` build output (recommended default)
+
+When `RealScript` sits at the sibling path `../RealScript/build`, `RealScript-GamePack` discovers and links its prebuilt libraries directly without recompiling `RealScript`:
+
+```powershell
+cmake -S C:\Projects\RealScript-GamePack -B C:\Projects\RealScript-GamePack\build -DREALSCRIPT_BUILD_DIR="C:\Projects\RealScript\build"
+cmake --build C:\Projects\RealScript-GamePack\build --config Release --parallel 8
+ctest --test-dir C:\Projects\RealScript-GamePack\build -C Release --output-on-failure --parallel 8
+```
+
+### 2. Against an installed `RealScript` SDK
 
 ```powershell
 cmake -S C:\Projects\RealScript-GamePack -B C:\Projects\RealScript-GamePack\build -DCMAKE_PREFIX_PATH="C:\Projects\RealScript\build\sdk"
@@ -26,23 +36,16 @@ cmake --build C:\Projects\RealScript-GamePack\build --config Release --parallel 
 ctest --test-dir C:\Projects\RealScript-GamePack\build -C Release --output-on-failure --parallel 8
 ```
 
-### 2. Against a local `RealScript` source checkout
-
-```powershell
-cmake -S C:\Projects\RealScript-GamePack -B C:\Projects\RealScript-GamePack\build -DREALSCRIPT_SOURCE_DIR="C:\Projects\RealScript"
-cmake --build C:\Projects\RealScript-GamePack\build --config Release --parallel 8
-ctest --test-dir C:\Projects\RealScript-GamePack\build -C Release --output-on-failure --parallel 8
-```
-
 ### 3. Headless / Slim Runtime Configuration
 
-When shipping a dedicated client/server without an embedded compiler, JIT, or hot-reload host:
+When shipping a dedicated client/server without an embedded compiler, JIT, or hot-reload host, first build a slim `RealScript` output tree (`-DREALSCRIPT_SLIM_RUNTIME=ON`) and point `RealScript-GamePack` directly to that build directory:
 
 ```powershell
+cmake -S C:\Projects\RealScript -B C:\Projects\RealScript\build-slim -DREALSCRIPT_SLIM_RUNTIME=ON
+cmake --build C:\Projects\RealScript\build-slim --config Release --parallel 8
+
 cmake -S C:\Projects\RealScript-GamePack -B C:\Projects\RealScript-GamePack\build-slim `
-  -DREALSCRIPT_SOURCE_DIR="C:\Projects\RealScript" `
-  -DREALSCRIPT_SLIM_RUNTIME=ON `
-  -DREALSCRIPT_BUILD_TESTS=ON
+  -DREALSCRIPT_BUILD_DIR="C:\Projects\RealScript\build-slim"
 cmake --build C:\Projects\RealScript-GamePack\build-slim --config Release --parallel 8
 ctest --test-dir C:\Projects\RealScript-GamePack\build-slim -C Release --output-on-failure
 ```

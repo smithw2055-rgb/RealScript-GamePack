@@ -10,14 +10,24 @@ option(REALSCRIPT_GAMEPACK_BUILD_BENCHMARKS "Build RealScript GamePack benchmark
 option(REALSCRIPT_GAMEPACK_INSTALL_SDK "Generate installable RealScriptGamePack SDK targets" ON)
 option(REALSCRIPT_GAMEPACK_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
-set(REALSCRIPT_SOURCE_DIR "" CACHE PATH "Optional path to a local RealScript source tree when building bundled")
+set(REALSCRIPT_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../RealScript/build"
+    CACHE PATH "Path to a RealScript build tree or installed SDK prefix containing RealScriptConfig.cmake")
+
+if(DEFINED REALSCRIPT_SOURCE_DIR AND NOT "${REALSCRIPT_SOURCE_DIR}" STREQUAL "")
+    message(WARNING "REALSCRIPT_SOURCE_DIR is deprecated and ignored; RealScriptGamePack consumes prebuilt RealScript outputs via RealScript_DIR / REALSCRIPT_BUILD_DIR / CMAKE_PREFIX_PATH.")
+endif()
 
 if(NOT TARGET RealScript::SlimRuntime)
-    if(REALSCRIPT_SOURCE_DIR AND EXISTS "${REALSCRIPT_SOURCE_DIR}/CMakeLists.txt")
-        add_subdirectory("${REALSCRIPT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/_deps/realscript")
-    else()
-        find_package(RealScript CONFIG REQUIRED)
-    endif()
+    find_package(RealScript CONFIG REQUIRED
+        HINTS
+            "${REALSCRIPT_BUILD_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../RealScript/build"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../RealScript/build/sdk"
+    )
+endif()
+
+if(DEFINED RealScript_SLIM_RUNTIME)
+    set(REALSCRIPT_SLIM_RUNTIME "${RealScript_SLIM_RUNTIME}")
 endif()
 
 if(NOT TARGET RealScript::SlimRuntime OR NOT TARGET RealScript::BindGenRuntime OR
@@ -161,12 +171,35 @@ if(REALSCRIPT_GAMEPACK_BUILD_TESTS)
         COMMAND realscript_game_runtime_slim_tests)
 endif()
 
-if(REALSCRIPT_GAMEPACK_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
+set(realscript_gamepack_export_targets realscript_game_runtime)
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+    list(APPEND realscript_gamepack_export_targets
+        realscript_game_compiler
+        realscript_app_game_sdk
+    )
+endif()
+
+file(TO_CMAKE_PATH "${RealScript_DIR}" REALSCRIPT_CONFIG_HINT_DIR)
+export(
+    TARGETS ${realscript_gamepack_export_targets}
+    NAMESPACE RealScript::
+    FILE "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackTargets.cmake"
+)
+configure_package_config_file(
+    cmake/RealScriptGamePackConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackConfig.cmake"
+    INSTALL_DESTINATION .
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion
+)
+
+if(REALSCRIPT_GAMEPACK_INSTALL_SDK)
+    set(REALSCRIPT_CONFIG_HINT_DIR "")
     install(
-        TARGETS
-            realscript_app_game_sdk
-            realscript_game_runtime
-            realscript_game_compiler
+        TARGETS ${realscript_gamepack_export_targets}
         EXPORT RealScriptGamePackTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -175,13 +208,8 @@ if(REALSCRIPT_GAMEPACK_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     configure_package_config_file(
         cmake/RealScriptGamePackConfig.cmake.in
-        "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/InstallConfig/RealScriptGamePackConfig.cmake"
         INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScriptGamePack
-    )
-    write_basic_package_version_file(
-        "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackConfigVersion.cmake"
-        VERSION ${PROJECT_VERSION}
-        COMPATIBILITY SameMinorVersion
     )
     install(
         EXPORT RealScriptGamePackTargets
@@ -191,7 +219,7 @@ if(REALSCRIPT_GAMEPACK_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
     )
     install(
         FILES
-            "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackConfig.cmake"
+            "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/InstallConfig/RealScriptGamePackConfig.cmake"
             "${CMAKE_CURRENT_BINARY_DIR}/RealScriptGamePackConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScriptGamePack
     )
